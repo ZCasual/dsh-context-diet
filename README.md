@@ -216,6 +216,8 @@ dsh --profile <profile> --dump-config | grep -A3 dsh-context-diet
   once per session and again only for `/context-diet show`.
 - The cumulative `y saved` total starts at zero for a new process; a resumed
   session knows what is elided but not how many requests the previous process saw.
+- Until the first step or `/context-diet` command after a resume, `/context-diet/stats`
+  reports zeroes; the first step fills them from the replayed log.
 - An abandoned native compaction bracket older than ten minutes is cleared so a
   crashed compaction cannot stop elision for the rest of the session.
 

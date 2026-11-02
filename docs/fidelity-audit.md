@@ -357,3 +357,66 @@ compaction bracket 探针：`PASS unclosed bracket (live) blocks replacements` /
 - **P1-2：主路径确认已修**；在 **fork / subagent 会话**上仍有缺口（N1），属"部分修"。
 - **P2-6：撤回**（baseline module id 合法）。
 - 因此"core 是 1:1 移植、适配层差异已界定"的表述在**普通 resume/restart** 场景成立；在 **fork/subagent** 场景需先修 N1 才能说"恢复语义完整"。建议发布前只做 **N1 一处代码修**（`ownEvents` → `snapshotEvents` + cursor 语义）并补一个 fork 测试；N2–N5 可随后清理。
+
+
+---
+
+# 8. 最终复审（第三轮，2026-11-03 02:23–02:30，N1/N5 修复确认）
+
+**方法**：重读当前 `index.js`（40,948 B，mtime 02:23）改动点；跑 `npm test`（**187/187**，仓库新增了 fork/stale-bracket 测试）与
+`node --test test/parity.test.js`（**105/105**）；用我自己的脚本复核：fork（两种场景）、普通 resume 回归、stale bracket（实时 + hydrate 两条路径）、
+post-restart 新结果裁剪。所有脚本内嵌于 §8.3（`/tmp` 每次调用会重建）。
+
+## 8.1 逐项状态
+
+| 项 | 状态 | 我独立验证到的证据 |
+|---|---|---|
+| **N1：fork/继承前缀** | **已修** | 代码：`hydrate` 用 `session.snapshotEvents()`（`index.js:304`）、`messagesWithOriginals` 用 `snapshotEvents()`（`:406`）、`observeLog` 用 `snapshotEvents(state.cursor)` 且 `state.cursor += events.length`（`:448,495`）；`grep ownEvents index.js` 只剩注释（`:447,783`），**无代码调用**。实测（`final2.mjs`，10/10）：父 6 turn 裁 4 条 → fork 子会话 `inheritedEventCount=38 / ownEvents=3 / snapshotEvents=41 / surface stubs=4`；hydrate 后 `lastCount=4, lastChars=22736`、recovery `{recovered:0, elided:4}`；`/show` 报 `elided now: 4 (~7.9k tokens)` + `bash echo turn-0 5.9 KB`（原文，不是 201 B stub）+ `next cold start: none`；fork 后新 pass 只裁"新变老"的继承结果（stub 4→6），**没有对已有 stub 再包一层**。 |
+| — 保护跨 fork | **已修（同一改动覆盖）** | 父会话 `{recovered:2, elided:7, recoveredChars:11778, protectedTools:['bash']}` → fork 子会话 hydrate 后**逐字段相同**；此后 `bash` 结果不再被裁（受保护），而未受保护的 `read` 结果仍会被裁（`restart5.mjs`：`read0` 被裁、近期 `read2` 保留）。 |
+| **N5：陈旧 compaction bracket** | **已修** | 代码：`STALE_BRACKET_MS = 10 * 60 * 1000`（`index.js:117`）；`bracketSince` 在 state（`:813`）、hydrate（`:314-324`）、observeLog（`:458-463`）维护；`runPass` 在 `:583-587` 判断 `Date.now()-since < STALE_BRACKET_MS` 则阻塞，否则清除 + `warn` 一次。实测（`final.mjs` C 段，5/5）：新 bracket 阻塞；`10min-1ms` 仍阻塞；`10min+1ms` 清除并恢复裁剪（gen 0→2）、warn 恰好 1 次；**hydrate 路径**：bracket `event.time=NOW`，重启后时钟 `NOW+30min` → 首个 pass 即清除并裁剪（gen 2），warn 恰好 1 次。 |
+| **N3：hydrate 后瞬态计数** | **保留（接受）** | 我复现："4 results elided … ~0 tokens saved over 0 requests · 0 cold starts"——累计从本进程起算的诚实瞬态。补充一个同性质现象：resume 后若尚未发生 pass/命令，`/context-diet/stats`（客户端轮询端点）返回全零状态，footer 下一步即被填充；属瞬态，非缺陷，建议与 N3 一起写进 README「Known limits」。 |
+| **N4：成本** | **保留（接受）** | `hydrate` 每会话一次 O(log)，`snapshotEvents()`/`snapshotEvents(cursor)` 返回新数组（O(n) 内存峰值）；`/show` 每次 O(log)；LRU 8 会话淘汰后重建会重扫。`savedByCall` 每条仅两个数字、`state.calls` 上限 8192，无泄漏。小样本未见性能问题；超长会话可接受的"一次性/用户触发"成本。 |
+| **N2（上轮附带）** | **自动消解** | `ownEvents()`（deprecated）调用已全部移除，仅注释提及，API 风险关闭。 |
+| **P2-6** | **撤回维持** | 不改 `inject`；上轮结论已作废（baseline module id 合法）。 |
+
+## 8.2 关于我上一轮"两条 FAIL"的更正（诚实记录）
+
+- 我首版 fork 脚本对两个断言算错了：keepTurns=1 时 `age==1` 属"保留"、`age>1` 才裁；且受保护的 `bash` 本就不应再裁。修正脚本后
+  `final2.mjs` **10/10**、`restart5.mjs` PASS。**不是实现缺陷**。
+- 另：我上一轮看到的一次 `recoveredChars=NaN` 在最终文件中不可复现（hydrate 的 `meter.track` 已带 `chars`，见 `:353-360`）；复核实测
+  `recoveredChars` 11778 前后一致，判定为编辑中间态，未列为缺陷。
+
+## 8.3 复核实测脚本（关键片段）
+
+fork 复核（`/tmp/fid/final2.mjs`，10/10）：
+
+```js
+const boundary = parent.seq - 1
+const seed = buildForkSeed(parent.snapshotEvents(), boundary)
+const child = Session.create('fa2-child', seed,
+  { ...draft.header, id: 'fa2-child', isSeeded: true, parentSession: parent.id }, boundary + 1)
+// 实测：inherited=38 own=3 snap=41 stubs=4
+// /status: this session: 4 results elided (~7.6k tokens kept out of every request) ...
+// /show  : elided now: 4 (~7.9k tokens) / bash echo turn-0  5.9 KB / next cold start: none
+// 保护继承: parent {recovered:2,elided:7,recoveredChars:11778,protectedTools:['bash']} == child
+```
+
+stale bracket 复核（`/tmp/fid/final.mjs` C 段，5/5）：
+
+```js
+s.append('compaction/start', { source: 'auto', turn: 3 })
+await h.emitPreStep(preStep(s), nextEnter())          // 阻塞
+setClock(NOW + 10 * MIN - 1); await ...              // 仍阻塞
+setClock(NOW + 10 * MIN + 1); await ...              // 清除 + 恢复裁剪 + warn×1
+// restart 路径：bracket event.time=NOW，重启后 NOW+30min → 首个 pass 清除（gen 2），warn×1
+```
+
+普通 resume 回归（`/tmp/fid/restart3.mjs`）：`{elided:7, recovered:2, recoveredChars:11778, protectedTools:['bash']}` 重启前后逐字段一致；
+重启后 `bash` 不再被裁（受保护）符合预期，未受保护的 `read` 仍被裁（`restart5.mjs` PASS）。
+
+## 8.4 最终发布判断
+
+**N1、N5 均确认修复，且我用自己的 fork 夹具与 stale-bracket 夹具复现了实现者给出的行为；普通 resume/restart 与 fork/subagent 两条路径的恢复语义
+（elided / recovered / recoveredChars / protectedTools / 原文尺寸 / 跨重启 bracket）现在都完整。** 结合第二轮结论，本项目可以以
+"**core 是 pi-context-diet 的 1:1 策略移植，Host 适配层因 DSH durable-surface 模型存在已界定差异**"发布；N3/N4 为已记录的诚实瞬态与
+一次性成本，上轮 P3 残留（`estimateTokens` 未导出、`completions` 死代码、`force` 早退未清、客户端轮询无 in-flight 去重）不阻塞发布。
