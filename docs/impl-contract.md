@@ -77,6 +77,11 @@ footerLine(config,stats,recovery?,extra?) -> string   // DSH 增补：把上游 
 
 不实现：warmArbitration / expectedTurns / stopWarmingShare / compact / compactAboveTokens（无 DSH seam，README 说明）。
 
+**实现补充（2026-11-03）**：`elideArgs` 在 DSH 不可落地（`assistant/message` surface replace
+被平台两条互斥规则拒绝）。因此 Config 不暴露该字段，适配器 `adapterConfig()` 恒定注入
+`elideArgs: false`；`/context-diet/stats` 的 `config` 仍会带出这个 pin 值（13 键），
+`statusLine` 因此显示 `write/edit args kept`。`/context-diet args on` 返回 error 说明平台限制。
+
 ## 3. Stats 与 footer
 
 Stats 字段（与上游同名）：`lastCount,lastArgCount,lastChars,cumulativeChars,requests,coldStarts`；DSH 增补 `lastPassAt`。

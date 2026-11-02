@@ -228,7 +228,12 @@ function readSurface(session) {
     }
     if (event === undefined || event === null) continue
     const type = event.type
-    if (type !== 'tool/result' && type !== 'assistant/message') continue
+    if (
+      type !== 'tool/result'
+      && type !== 'assistant/message'
+      && type !== 'user/message'
+      && type !== 'system/message'
+    ) continue
     let message
     try {
       message = session.deriveEventMessage(event)
@@ -268,6 +273,143 @@ function readSurface(session) {
   }
 
   return { messages, calls, resultSeq, assistantSeq }
+}
+
+// ---------------------------------------------------------------------------
+// Hydration: rebuild session state from the durable log
+// ---------------------------------------------------------------------------
+
+/**
+ * Rebuild the adapter state a fresh process cannot remember.
+ *
+ * pi persists `elided`, `elidedArgs` and the protected tools in session entries and
+ * restores them on session start (TS:791-812). DSH needs no side channel: the log
+ * already holds every replacement (`surfaceOp.op === 'replace'` plus
+ * `sourceEventSeqs`), so the same state is reconstructed deterministically, which
+ * also makes `/context-diet show` and the recovery meter correct after a resume.
+ *
+ * @param {object} session
+ * @param {object} state
+ * @param {object} config
+ */
+function hydrate(session, state, config) {
+  let events
+  try {
+    events = session.ownEvents()
+  } catch {
+    return
+  }
+  if (!Array.isArray(events)) return
+
+  // One chronological pass. Order matters: the meter may only count a call as a
+  // re-fetch once the replacement it re-fetches has been replayed, exactly as in a
+  // live process where `track` happens at the elision and `onCall` after it.
+  let bracketOpen = false
+  for (const event of events) {
+    const type = event?.type
+    if (type === 'compaction/start') {
+      bracketOpen = true
+      continue
+    }
+    if (type === 'compaction/end') {
+      bracketOpen = false
+      continue
+    }
+    if (type === 'tool/call') {
+      const data = event.data ?? {}
+      let args = {}
+      try {
+        const parsed = typeof data.arguments === 'string' ? JSON.parse(data.arguments) : data.arguments
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) args = parsed
+      } catch {
+        /* keep {} */
+      }
+      if (typeof data.callId !== 'string' || typeof data.name !== 'string') continue
+      if (state.calls.size < MAX_CALL_INDEX) state.calls.set(data.callId, { name: data.name, args })
+      const hit = state.meter.onCall(data.name, args)
+      if (hit !== undefined && config.autoProtect && !state.protectedTools.has(hit.tool)) {
+        if (state.meter.shouldProtect(hit.tool, config.recoveryThreshold, 5)) {
+          state.protectedTools.add(hit.tool)
+        }
+      }
+      continue
+    }
+    if (type !== 'tool/result' || event.surfaceOp?.op !== 'replace') continue
+    const message = safeDerive(session, event)
+    if (message === null || !isStubbed(message.content)) continue
+    const callId = message.toolCallId
+    if (typeof callId !== 'string') continue
+    const originalSeq = Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs[0] : undefined
+    const originalEvent = typeof originalSeq === 'number' ? safeEventAt(session, originalSeq) : undefined
+    const original = originalEvent === undefined ? null : safeDerive(session, originalEvent)
+    state.elided.add(callId)
+    state.savedByCall.set(callId, {
+      chars: original === null ? 0 : measure(original.content).chars,
+      stubChars: measure(message.content).chars,
+    })
+    const call = state.calls.get(callId)
+    if (call !== undefined) {
+      state.meter.track([{
+        id: callId,
+        tool: call.name,
+        args: call.args,
+        sig: callSignature(call.name, call.args),
+      }])
+    }
+  }
+
+  state.compactionOpen = bracketOpen
+  state.cursor = events.length
+  state.hydrated = true
+
+  // Seed the per-request view so the footer and `/context-diet status` describe the
+  // surface that actually exists after a resume. Cumulative totals intentionally
+  // start at zero: this process has observed no requests yet, and inventing them
+  // would overstate the savings.
+  if (state.elided.size > 0) {
+    let saved = 0
+    for (const record of state.savedByCall.values()) saved += Math.max(0, record.chars - record.stubChars)
+    state.stats.lastCount = state.elided.size
+    state.stats.lastArgCount = 0
+    state.stats.lastChars = saved
+  }
+}
+
+/**
+ * The surface messages with every stub replaced by its original content.
+ *
+ * `/context-diet show` must report the size a result *had*, not the size of the
+ * stub that now shadows it; reading the log is cheaper than keeping original
+ * payloads in memory.
+ * @param {object} session
+ * @param {any[]} messages
+ * @returns {any[]}
+ */
+function messagesWithOriginals(session, messages) {
+  /** @type {Map<string, any>} */
+  const originals = new Map()
+  let events
+  try {
+    events = session.ownEvents()
+  } catch {
+    return messages
+  }
+  for (const event of events) {
+    if (event?.type !== 'tool/result' || event.surfaceOp?.op !== 'replace') continue
+    const replacement = safeDerive(session, event)
+    if (replacement === null || !isStubbed(replacement.content)) continue
+    const callId = replacement.toolCallId
+    if (typeof callId !== 'string' || originals.has(callId)) continue
+    const originalSeq = Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs[0] : undefined
+    const originalEvent = typeof originalSeq === 'number' ? safeEventAt(session, originalSeq) : undefined
+    const original = originalEvent === undefined ? null : safeDerive(session, originalEvent)
+    if (original !== null) originals.set(callId, original.content)
+  }
+  return messages.map((m) =>
+    m.role === 'toolResult' && isStubbed(m.content) && originals.has(m.toolCallId)
+      ? { ...m, content: originals.get(m.toolCallId) }
+      : m,
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +560,7 @@ function runPass(ctx, agent, state, config, options = {}) {
   const session = agent?.session
   if (session === undefined || session === null) return 0
 
+  if (state.hydrated !== true) hydrate(session, state, config)
   observeLog(session, state, config)
   if (state.compactionOpen) return 0
 
@@ -435,78 +578,82 @@ function runPass(ctx, agent, state, config, options = {}) {
     protectedTools: state.protectedTools,
   })
 
-  if (decision.ids.length === 0 && decision.argIds.length === 0) {
-    // pi clears the per-request savings when nothing elided is in this request
-    // any more (a compaction may have replaced the surface under us), so the
-    // footer never advertises savings that are no longer real.
-    const live = messages.filter((m) => m.role === 'toolResult' && isStubbed(m.content)).length
-    if (live === 0) {
-      state.stats.lastCount = 0
-      state.stats.lastArgCount = 0
-      state.stats.lastChars = 0
+  let nextMessages = messages
+  let landed = 0
+
+  if (decision.ids.length > 0) {
+    const applied = applyElision(messages, new Set(decision.ids), {
+      argIds: new Set(),
+      preview: { tail: config.stubTailLines, errors: config.stubErrorLines },
+    })
+    nextMessages = applied.messages
+
+    // ---- tool results: 1:1 durable replacement ----
+    for (const info of applied.infos) {
+      if (options.signal !== undefined && options.signal.aborted) break
+      const seq = state.resultSeq.get(info.id)
+      if (seq === undefined) continue
+      const next = nextMessages.find((m) => m.role === 'toolResult' && m.toolCallId === info.id)
+      if (next === undefined) continue
+      const event = safeEventAt(session, seq)
+      if (event === undefined) continue
+      const current = safeDerive(session, event)
+      if (current === null || isStubbed(current.content)) continue
+      try {
+        appendShadowPrice(ctx, session, seq, current)
+        session.append(
+          'tool/result',
+          { ...event.data, message: { ...current, content: next.content } },
+          { surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq }, sourceEventSeqs: [seq] },
+        )
+        state.elided.add(info.id)
+        state.savedByCall.set(info.id, {
+          chars: measure(current.content).chars,
+          stubChars: measure(next.content).chars,
+        })
+        landed += 1
+      } catch (error) {
+        warn(ctx, `context-diet: replacement rejected at seq ${seq}: ${String(error)}`)
+        break
+      }
     }
-    state.force = false
-    return 0
-  }
 
-  const applied = applyElision(messages, new Set(decision.ids), {
-    argIds: new Set(decision.argIds),
-    preview: { tail: config.stubTailLines, errors: config.stubErrorLines },
-  })
-  if (applied.count === 0 && applied.argCount === 0) {
-    state.force = false
-    return 0
-  }
-
-  let landedResults = 0
-  let landedArgs = 0
-
-  // ---- tool results: 1:1 durable replacement ----
-  for (const info of applied.infos) {
-    if (options.signal !== undefined && options.signal.aborted) break
-    const seq = state.resultSeq.get(info.id)
-    if (seq === undefined) continue
-    const next = applied.messages.find((m) => m.role === 'toolResult' && m.toolCallId === info.id)
-    if (next === undefined) continue
-    const event = safeEventAt(session, seq)
-    if (event === undefined) continue
-    const current = safeDerive(session, event)
-    if (current === null || isStubbed(current.content)) continue
-    try {
-      appendShadowPrice(ctx, session, seq, current)
-      session.append(
-        'tool/result',
-        { ...event.data, message: { ...current, content: next.content } },
-        { surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq }, sourceEventSeqs: [seq] },
-      )
-      state.elided.add(info.id)
-      landedResults += 1
-    } catch (error) {
-      warn(ctx, `context-diet: replacement rejected at seq ${seq}: ${String(error)}`)
-      break
+    // Write/edit argument elision is not expressible on this platform: see the
+    // Config comment. `applyElision` never receives argIds, so those stay kept.
+    if (landed > 0) {
+      state.meter.track(applied.infos)
+      if (decision.cold) state.stats.coldStarts += 1
     }
   }
 
-  // Write/edit argument elision is not expressible on this platform: see the
-  // Config comment. `applyElision` never receives argIds, so `landedArgs` stays
-  // 0 and the statistics report results only.
-
-  if (landedResults + landedArgs === 0) {
-    state.force = false
-    return 0
+  // pi updates the per-request statistics from the *whole* request, not from what
+  // this pass happened to land (TS:1077-1096): a warm request still reports every
+  // result that is currently elided, and the footer therefore never under-reports.
+  const stubs = nextMessages.filter((m) => m.role === 'toolResult' && isStubbed(m.content))
+  if (stubs.length === 0) {
+    state.stats.lastCount = 0
+    state.stats.lastArgCount = 0
+    state.stats.lastChars = 0
+  } else {
+    let saved = 0
+    for (const stub of stubs) {
+      const record = state.savedByCall.get(stub.toolCallId)
+      if (record !== undefined) saved += Math.max(0, record.chars - record.stubChars)
+    }
+    state.stats.requests += 1
+    state.stats.lastCount = stubs.length
+    state.stats.lastArgCount = 0
+    state.stats.lastChars = saved
+    state.stats.cumulativeChars += saved
+    state.stats.lastPassAt = Date.now()
   }
 
-  state.meter.track(applied.infos)
-  state.stats.requests += 1
-  state.stats.lastCount = landedResults
-  state.stats.lastArgCount = landedArgs
-  state.stats.lastChars = applied.savedChars
-  state.stats.cumulativeChars += applied.savedChars
-  state.stats.lastPassAt = Date.now()
-  if (decision.cold) state.stats.coldStarts += 1
-  state.pendingChars = charsOfMessages(applied.messages)
+  // pi calibrates chars-per-token from the characters it sent against the
+  // provider's billed prompt tokens, so the whole request is measured here, not
+  // just the results this plugin is interested in.
+  state.pendingChars = charsOfMessages(nextMessages)
   state.force = false
-  return landedResults + landedArgs
+  return landed
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +776,10 @@ export function apply(ctx, config) {
       stats: emptyStats(),
       /** Characters of the request the provider is answering (calibration). */
       pendingChars: 0,
+      /** callId → { chars, stubChars } for every elided result, so savings survive a pass. */
+      savedByCall: new Map(),
+      /** True once the log has been replayed into this state. */
+      hydrated: false,
       /** Set by `/context-diet now`. */
       force: false,
       /** Session-scoped overrides (never persisted; DSH keeps config in the profile). */
@@ -863,6 +1014,20 @@ function createCommandHandler(ctx, base, stateOf, touch) {
       const command = parseCommand(argText)
       const config = state === undefined ? adapterConfig(base) : adapterConfig(base, state.overrides)
 
+      // `/context-diet` can be the first thing that touches a resumed session, so
+      // the log is replayed here too instead of waiting for the next step.
+      if (state !== undefined) {
+        if (state.hydrated !== true) hydrate(session, state, config)
+        if (state.lastMessages.length === 0) {
+          const surface = readSurface(session)
+          state.calls = surface.calls
+          state.resultSeq = surface.resultSeq
+          state.assistantSeq = surface.assistantSeq
+          state.lastMessages = surface.messages
+        }
+        refreshFooter(state, config)
+      }
+
       if (command.kind === 'invalid') return { kind: 'error', text: `context-diet: ${command.message}` }
 
       if (command.kind === 'status') {
@@ -876,7 +1041,7 @@ function createCommandHandler(ctx, base, stateOf, touch) {
 
       if (command.kind === 'show') {
         if (state === undefined) return { kind: 'success', text: 'context-diet: no active session' }
-        const messages = state.lastMessages
+        const messages = messagesWithOriginals(session, state.lastMessages)
         const elided = describeElided(messages, state.elided, state.elidedArgs)
         const candidates = describeCandidates(
           messages,
