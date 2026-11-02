@@ -6,6 +6,30 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-03
+
+Corrections found by an independent fidelity audit of 0.2.0.
+
+### Fixed
+
+- Statistics now describe the whole request, as upstream does: `lastCount` and
+  `lastChars` cover every result currently elided, each request with a stub adds
+  to `cumulativeChars`, and a surface without stubs clears the per-request
+  figures without losing the cumulative total.
+- A resumed or forked session rebuilds its state from the durable log in
+  chronological order: elided ids, original sizes, recovery counts and protected
+  tools are restored, so `/context-diet show` is correct before the first step.
+- The original producing call is no longer miscounted as a re-fetch on resume, and
+  `recoveredChars` stays finite and exact afterwards.
+- Calibration measures the whole request (user, assistant and system messages
+  included) against billed prompt tokens.
+- `/context-diet show` reports original sizes instead of the size of the stub that
+  shadows them, and is byte-stable across passes.
+- Forked and subagent sessions are read through `snapshotEvents()`, so an inherited
+  surface prefix is accounted for; previously they reported nothing elided.
+- A native compaction bracket that never closes is treated as abandoned after ten
+  minutes instead of stopping elision for the rest of the session.
+
 ## [0.2.0] - 2026-11-03
 
 A correctness release: the policy core is now a line-by-line port of
