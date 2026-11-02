@@ -1,7 +1,7 @@
 {
   "name": "dsh-context-diet",
-  "version": "0.1.0",
-  "description": "Durable, replay-safe elision of stale tool results from the model-visible DeepSeek Harness (DSH) session surface. Enabled by default.",
+  "version": "0.2.0",
+  "description": "Durable, replay-safe elision of stale tool results from the model-visible DeepSeek Harness (DSH) session surface, with a composer-footer savings readout. Enabled by default.",
   "keywords": [
     "deepseek-harness",
     "dsh",
@@ -10,9 +10,10 @@
     "cordis-plugin",
     "context",
     "tokens",
-    "compaction",
     "tool-result",
-    "session"
+    "session",
+    "context-window",
+    "focus"
   ],
   "license": "MIT",
   "author": "dsh-context-diet contributors",
@@ -29,6 +30,7 @@
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
     "./package.json": "./package.json"
@@ -36,6 +38,7 @@
   "files": [
     "index.js",
     "core.js",
+    "client.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
@@ -44,7 +47,7 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.js test/unit/*.test.js",
-    "check": "node --check index.js && node --check core.js"
+    "check": "node --check index.js && node --check core.js && node --check client.js"
   },
   "engines": {
     "node": ">=22.19.0",
@@ -75,6 +78,14 @@
     "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
     }
   }
 }

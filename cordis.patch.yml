@@ -2,6 +2,15 @@
 # session-only pause, or edit this ordinary Config through the profile patch.
 # Do not add `disabled: true` unless unloading the Host plugin is intended.
 #
+# The package also ships a Client half: `package.json` declares `dsh.client`
+# (platform web, immediately) and `exports["./client"]`, so the Web UI loads
+# `client.js` and appends the `context-diet` entry to
+# `conversation.composer.dock`. That half has no row of its own; it renders only
+# after a Session is selected, and it renders nothing while
+# `GET /context-diet/stats` reports an empty footer. Editing `client.js` in an
+# installed profile needs a page reload (then a restart if the bundle revision is
+# cached); enabling or disabling this row alone hot-reloads.
+#
 # Overriding this row replaces the whole `config` block. The explicit enabled
 # value keeps the profile default clear; all other keys use Config defaults.
 - insert:

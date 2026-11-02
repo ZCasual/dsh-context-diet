@@ -1,699 +1,716 @@
 /**
- * @local/dsh-context-diet — Host-half policy plugin (no client half).
+ * dsh-context-diet — Host half.
  *
- * Migrates the core idea of `pi-context-diet` onto the DSH 0.2.1-rc.5 seams that
- * actually exist: `agent/pre-step` + durable `tool/result` surface replacement.
- * DSH has no per-request message rewrite and no client-visible cache state, so
- * this plugin rewrites the *durable* model surface once and lets it stay stable.
+ * This is the DSH adapter around the pure strategy core in `core.js`, which is a
+ * faithful port of pi-context-diet. The adapter's whole job is translation:
  *
- * Hard constraints this file is written against (verified against the installed
- * `@deepseek-ai/dsh` 0.2.1-rc.5):
- *   - `preStep()` assembles the prompt BEFORE the waterfall and derives request
- *     messages AFTER it, so surface edits here affect the current request while
- *     prompt edits would not.
- *   - `session.append('tool/result', …, {surfaceOp:{op:'replace',…}, sourceEventSeqs})`
- *     validation (`dsh-session/lib/types/surface.js`) accepts exactly one current
- *     `tool/result` node, requires `sourceEventSeqs` to cover it, and allows ONLY
- *     `message.content` to differ from the shadowed event.
- *   - `compaction/prune` is a known, log-only session event; its shadow-price
- *     protocol requires it to be appended synchronously right before the
- *     replacement. No `compaction/start` bracket is required (the shipped
- *     `dsh-compaction-tool-result-pruner` does exactly this).
- *   - cordis 4.0.5 `inject` is `string[] | Record<string, interceptConfig>`; there
- *     is no required/optional object form, so every use below is also
- *     feature-detected at runtime and degrades instead of throwing.
+ *   DSH session surface  →  pi-shaped messages  →  core.decide / core.applyElision
+ *                        ←  durable surface replacement
  *
- * ---------------------------------------------------------------------------
- * `./core.js` contract (pure functions, no DSH imports) — v1
- * ---------------------------------------------------------------------------
- *   STUB_MARKER: string
- *   isStubbed(content: ContentBlock[]): boolean
- *   resolvePolicy(config: object, overrides: object|undefined): Policy
- *      Policy = { enabled, agePolicy:'off'|'approximate'|'always', coldTtlMinutes,
- *                 keepTurns, minChars, stubTailLines, stubErrorLines,
- *                 maxPerPass, neverElide:string[] }
- *   planElisions(snapshot: Snapshot, policy: Policy):
- *      { plans: Array<{ seq, content: ContentBlock[], charsBefore, charsAfter }> }
- *      Snapshot = { now, lastRequestTime, maxTurn, nodes: Array<{
- *                    seq, turn, chars, isError, plain, toolName, message }> }
- *   parseCommand(rawInput: string):
- *      { kind:'status'|'on'|'off'|'now'|'show'|'args'|'compact'
- *             |'keep'|'ttl'|'mode'|'invalid', ... }
- *   measure(content): { chars, lines, textOnly }   // code points, never UTF-16 units
- *   statusText(state: { policy, overrides, stats, lastPass, detailed? }): string
- *
- * If `core.js` is not present yet, the test suite substitutes a contract double
- * (see test/plugin.test.js); keep this contract in sync.
+ * Deliberate design points
+ * ------------------------
+ * 1. **One core.** There is no second "DSH policy" implementation. Every gate
+ *    (cold timeout, keepTurns, minChars, keepErrors, neverElide, protected tools,
+ *    write/edit argument elision) lives in `core.js`, shared with the parity
+ *    tests that were ported from the upstream test suite.
+ * 2. **A node is elided once, then stays elided.** pi re-decides on every request
+ *    and re-applies to a per-request copy, which keeps the prompt prefix
+ *    byte-stable between cold starts. DSH has no per-request surface: the only
+ *    writable surface is the durable session log. The adapter therefore lands a
+ *    replacement once (`surfaceOp: replace`) and never revisits it, which keeps
+ *    the same observable property pi relies on.
+ * 3. **Not a compaction plugin.** Nothing here summarises, rewrites or discards
+ *    history. The only log-only event written is the platform's
+ *    `compaction/prune` shadow price — the native tool-result pruner's own
+ *    accounting convention, needed so token accounting does not count both the
+ *    original node and its replacement.
+ * 4. **Fail open.** A pre-step error must never break a turn.
  */
 
 import Schema from '@deepseek-ai/schemastery'
+
 import {
+  ARG_TOOLS,
+  Calibrator,
+  DEFAULT_CONFIG,
+  RecoveryMeter,
+  applyElision,
+  callSignature,
+  charsOfMessages,
+  decide,
+  describeCandidates,
+  describeElided,
+  formatTokens,
+  hasThinking,
+  indexCalls,
   isStubbed,
   measure,
   parseCommand,
-  planElisions,
-  resolvePolicy,
-  statusText,
+  policyOf,
+  sanitizeConfig,
+  showLines,
+  staleTokens,
+  statusLine,
+  footerLine,
+  USAGE,
 } from './core.js'
 
-/** Cordis plugin name; must stay kebab-case and unique in a profile. */
+/** Cordis plugin name; also the Loader row id used by the bundle patch. */
 export const name = 'context-diet'
 
-/**
- * Services the policy reads. `tokenMeter` prices shadowed nodes for the
- * shadow-price protocol; `sessionProjections` keeps per-session counters;
- * `commands` exposes the human `/context-diet` surface.
- *
- * All three are host-plane singletons mounted by `@deepseek-ai/dsh-base`
- * (`session-projection`, `commands`, `token-meter`), so declaring them is safe
- * in every base-backed profile and guarantees ordering. cordis 4.0.5 `inject`
- * has no required/optional object form (`string[] | Record<string, intercept>`),
- * so every use is ALSO resolved through `service()` and degrades instead of
- * throwing when a reduced harness exposes no method or no instance.
- */
-export const inject = ['tokenMeter', 'sessionProjections', 'commands']
+/** Only `commands` is required; `tokenMeter`/`webServer` are used when present. */
+export const inject = ['commands']
 
-/** Deployment-tunable policy. Enabled by default; the settings page can disable it. */
+/**
+ * Plugin config. Defaults mirror `DEFAULT_CONFIG` in `core.js` (and therefore
+ * upstream pi-context-diet); the bounds mirror `sanitizeConfig`.
+ *
+ * `elideArgs` is deliberately absent. pi can rewrite a stale `write`/`edit`
+ * tool call because it owns the per-request messages; DSH cannot: a tool call
+ * lives in a `tool/call` event and in the assistant message's `tool-call`
+ * blocks, and the platform rejects an `assistant/message` surface replacement
+ * with mutually exclusive errors ("sourceEventSeqs must include every shadowed
+ * surface node" versus "assistant/message embeds its source stream and cannot
+ * carry sourceEventSeqs"). The adapter therefore always runs with
+ * `elideArgs: false`, which is also what `statusLine` reports.
+ */
 export const Config = Schema.object({
-  enabled: Schema.boolean().default(true),
-  agePolicy: Schema.union(['off', 'approximate', 'always']).default('approximate'),
-  coldTtlMinutes: Schema.number().step(1).min(1).max(1440).default(5),
-  keepTurns: Schema.number().step(1).min(0).max(500).default(20),
-  minChars: Schema.number().step(1).min(200).max(1_000_000).default(1500),
-  stubTailLines: Schema.number().step(1).min(0).max(10).default(3),
-  stubErrorLines: Schema.number().step(1).min(0).max(10).default(3),
-  maxPerPass: Schema.number().step(1).min(1).max(128).default(8),
-  neverElide: Schema.array(Schema.string()).default([]),
+  enabled: Schema.boolean().default(DEFAULT_CONFIG.enabled),
+  mode: Schema.union(['cold', 'always']).default(DEFAULT_CONFIG.mode),
+  keepTurns: Schema.number().step(1).min(1).max(500).default(DEFAULT_CONFIG.keepTurns),
+  minChars: Schema.number().step(1).min(200).max(1_000_000).default(DEFAULT_CONFIG.minChars),
+  cacheTtlMinutes: Schema.number().step(1).min(1).max(1440).default(DEFAULT_CONFIG.cacheTtlMinutes),
+  keepErrors: Schema.boolean().default(DEFAULT_CONFIG.keepErrors),
+  neverElide: Schema.array(Schema.string()).default([...DEFAULT_CONFIG.neverElide]),
+  showStatus: Schema.boolean().default(DEFAULT_CONFIG.showStatus),
+  stubTailLines: Schema.number().step(1).min(0).max(10).default(DEFAULT_CONFIG.stubTailLines),
+  stubErrorLines: Schema.number().step(1).min(0).max(10).default(DEFAULT_CONFIG.stubErrorLines),
+  autoProtect: Schema.boolean().default(DEFAULT_CONFIG.autoProtect),
+  recoveryThreshold: Schema.number().min(0.05).max(1).default(DEFAULT_CONFIG.recoveryThreshold),
 })
 
-/** Projection key + version for the durable counters (JSON-only state). */
-const PROJECTION_KEY = 'contextDiet'
-const PROJECTION_VERSION = 1
-/** Bounded memory for the re-fetch (recovery) counter. */
-const MAX_TRACKED = 64
+/**
+ * Sanitize a plugin config for the adapter: the user's Config, then session
+ * overrides, then the clamps. `elideArgs` is pinned to false because DSH
+ * cannot rewrite a tool call's arguments (see the Config comment).
+ * @param {Record<string, unknown>} base
+ * @param {Record<string, unknown>} [overrides]
+ * @returns {object}
+ */
+function adapterConfig(base, overrides = {}) {
+  return sanitizeConfig({ ...(base ?? {}), ...overrides, elideArgs: false })
+}
+
+/** Read-only stats endpoint polled by the Client footer. */
+const STATS_ENDPOINT = '/context-diet/stats'
+
+/** How many finished-but-referenced sessions the stats endpoint remembers. */
+const MAX_TRACKED_SESSIONS = 8
+
+/** Hard cap on the adapter's call index, so a pathological session stays bounded. */
+const MAX_CALL_INDEX = 8192
 
 /**
- * Per-session runtime state that must not outlive the agent: the incremental
- * compaction-lock scan cursor, command overrides, and the last pass summary.
- * Durable counters live in the projection instead.
+ * @typedef {object} Stats
+ * @property {number} lastCount
+ * @property {number} lastArgCount
+ * @property {number} lastChars
+ * @property {number} cumulativeChars
+ * @property {number} requests
+ * @property {number} coldStarts
+ * @property {number} lastPassAt
  */
-const sessions = new WeakMap()
 
-function sessionState(session) {
-  let state = sessions.get(session)
-  if (state === undefined) {
-    state = {
-      /** Log cursor shared by the compaction lock, call index and recovery meter. */
-      scanOffset: 0,
-      compactionOpen: false,
-      lastRequestTime: 0,
-      /** callId -> tool name, for stub/preview labelling. */
-      callNames: new Map(),
-      /** callId -> { tool, signature }, for recovery attribution. */
-      calls: new Map(),
-      /** signature -> { tool } of results this plugin already elided. */
-      elidedSignatures: new Map(),
-      /** tool -> { elided, recovered }. */
-      recoveryStats: new Map(),
-      protectedTools: new Set(),
-      overrides: {},
-      forceOnce: false,
-      lastPass: undefined,
-      passes: 0,
-      appends: 0,
-      failures: 0,
-    }
-    sessions.set(session, state)
-  }
-  return state
-}
-
-const RECOVERY_THRESHOLD = 0.25
-const RECOVERY_MIN_SAMPLE = 5
-/** Bounds so a very long session cannot grow the runtime maps without limit. */
-const MAX_CALLS = 4096
-const MAX_ELIDED_SIGNATURES = 256
-
-/** Drop the oldest entries until the map is within its cap (insertion order). */
-function trimMap(map, cap) {
-  while (map.size > cap) {
-    const oldest = map.keys().next()
-    if (oldest.done) break
-    map.delete(oldest.value)
-  }
-}
-
-function recoverySignature(name, args) {
-  return `${name}\u0000${typeof args === 'string' ? args : ''}`
-}
-
-
-/**
- * Advance one incremental pass over the session log. One cursor serves the
- * compaction lock, the tool-call index, the last request time, and the recovery
- * meter, so a pre-step never rescans the whole log.
- *
- * Only results this plugin actually stubbed (marker check) count as elisions:
- * native `compaction`/`tool-result-pruner` replacements carry a different stub
- * and must not inflate the recovery meter.
- *
- * @param session - the live session whose log is scanned from `state.scanOffset`.
- * @param state - per-session runtime state carrying the cursor.
- */
-function scanLog(session, state) {
-  const end = Number(session.seq)
-  for (let seq = state.scanOffset; seq < end; seq += 1) {
-    const event = session.eventAt(seq)
-    if (event === undefined) continue
-    switch (event.type) {
-      case 'compaction/start':
-        state.compactionOpen = true
-        break
-      case 'compaction/end':
-      case 'session/end-seed':
-        state.compactionOpen = false
-        break
-      case 'request/header':
-        if (typeof event.time === 'number' && event.time > state.lastRequestTime) {
-          state.lastRequestTime = event.time
-        }
-        break
-      case 'tool/call': {
-        const name = event.data?.name
-        if (typeof name !== 'string') break
-        const callId = String(event.data.callId ?? '')
-        const signature = recoverySignature(name, event.data.arguments)
-        state.callNames.set(callId, name)
-        state.calls.set(callId, { tool: name, signature })
-        trimMap(state.callNames, MAX_CALLS)
-        trimMap(state.calls, MAX_CALLS)
-        const elided = state.elidedSignatures.get(signature)
-        if (elided !== undefined) {
-          const stats = state.recoveryStats.get(elided.tool) ?? { elided: 0, recovered: 0 }
-          stats.recovered += 1
-          state.recoveryStats.set(elided.tool, stats)
-          if (
-            stats.elided >= RECOVERY_MIN_SAMPLE
-            && stats.recovered / stats.elided > RECOVERY_THRESHOLD
-          ) {
-            state.protectedTools.add(elided.tool)
-          }
-        }
-        break
-      }
-      case 'tool/result': {
-        const op = event.surfaceOp
-        if (op === undefined || typeof op !== 'object') break
-        const message = event.data?.message
-        const blocks = message?.content
-        if (!Array.isArray(blocks) || !isStubbed(blocks)) break
-        const call = state.calls.get(String(message.source?.callId ?? ''))
-        if (call === undefined) break
-        const stats = state.recoveryStats.get(call.tool) ?? { elided: 0, recovered: 0 }
-        stats.elided += 1
-        state.recoveryStats.set(call.tool, stats)
-        state.elidedSignatures.set(call.signature, { tool: call.tool })
-        trimMap(state.elidedSignatures, MAX_ELIDED_SIGNATURES)
-        break
-      }
-      default:
-        break
-    }
-  }
-  if (Number.isFinite(end)) state.scanOffset = end
-}
-
-/**
- * Build the pure snapshot `core.planElisions` consumes.
- * @param session - live session; reads only the current surface and derived messages.
- * @param state - per-session scan state carrying the call index and request clock.
- * @param now - wall clock, injected for deterministic tests.
- * @returns snapshot of the current model surface.
- */
-function buildSnapshot(session, state, now) {
-  const nodes = []
-  const surface = session.surface
-  let maxTurn = 0
-
-  for (const seq of surface.nodes) {
-    const event = session.eventAt(seq)
-    if (event === undefined) continue
-    const turn = event.data !== undefined && typeof event.data.turn === 'number' ? event.data.turn : 0
-    if (turn > maxTurn) maxTurn = turn
-    if (event.type !== 'tool/result') continue
-    const message = session.deriveEventMessage(event)
-    if (message === null || message === undefined) continue
-    const content = Array.isArray(message.content) ? message.content : []
-    const measured = measure(content)
-    const replaced = event.surfaceOp !== undefined && typeof event.surfaceOp === 'object'
-    const plain = content.every((block) => block !== null && typeof block === 'object' && block.type === 'text')
-    const chars = measured.chars
-    nodes.push({
-      seq,
-      turn,
-      chars,
-      isError: message.isError === true,
-      plain,
-      replaced,
-      toolName: (message.source && state.callNames.get(message.source.callId)) || 'tool',
-      message,
-    })
-  }
-
-  return { now, lastRequestTime: state.lastRequestTime, maxTurn, nodes }
-}
-
-/** Best-effort logger: the plugin must never fail a turn because logging did. */
-function warn(ctx, message) {
-  try {
-    if (ctx && ctx.logger && typeof ctx.logger.warn === 'function') ctx.logger.warn(message)
-  } catch {
-    /* logging is best effort */
-  }
-}
-
-/**
- * Resolve one optional service defensively. `inject` lists the policy services,
- * but cordis 4.0.5 has no optional-inject form and a reduced harness (or a
- * focused test) may expose them only through `ctx.get()`.
- * @param ctx - plugin context.
- * @param name - service name.
- * @returns the service, or undefined when unavailable.
- */
-function service(ctx, name) {
-  try {
-    if (ctx !== undefined && typeof ctx.get === 'function') {
-      const found = ctx.get(name)
-      if (found !== undefined) return found
-    }
-  } catch {
-    /* fall through to the property form */
-  }
-  return ctx === undefined ? undefined : ctx[name]
-}
-
-/**
- * Apply the elision plan as durable 1:1 `tool/result` replacements.
- *
- * Fail-open by design: every replacement is independently guarded, the first
- * failure stops the pass, and the caller always continues the turn with
- * whatever content is currently on the surface.
- *
- * @param ctx - plugin context (tokenMeter + logger).
- * @param agent - the agent whose session surface is rewritten.
- * @param policy - resolved policy.
- * @param state - per-session runtime state.
- * @param signal - the pre-step abort signal.
- * @returns number of landed replacements.
- */
-function elideStale(ctx, agent, policy, state, signal) {
-  const session = agent.session
-  scanLog(session, state)
-  if (state.compactionOpen) return 0
-
-  const snapshot = buildSnapshot(session, state, Date.now())
-  if (policy.agePolicy === 'off') return 0
-  if (policy.agePolicy === 'approximate') {
-    const idleMinutes = snapshot.lastRequestTime === 0
-      ? Number.POSITIVE_INFINITY
-      : (snapshot.now - snapshot.lastRequestTime) / 60000
-    if (idleMinutes < policy.coldTtlMinutes) return 0
-  }
-
-  let plans
-  try {
-    const protectedNeverElide = [...new Set([...(policy.neverElide ?? []), ...state.protectedTools])]
-    plans = planElisions(snapshot, { ...policy, neverElide: protectedNeverElide }).plans
-  } catch (error) {
-    warn(ctx, `context-diet: planner failed: ${String(error)}`)
-    return 0
-  }
-  if (!Array.isArray(plans) || plans.length === 0) return 0
-
-  const meter = service(ctx, 'tokenMeter')
-  if (typeof meter?.estimateMessage !== 'function') {
-    // Without the meter we cannot price the shadowed node, and a 0-token claim
-    // would make `contextBreakdown` add the stub on top of the original price.
-    if (!state.pricingWarned) {
-      state.pricingWarned = true
-      warn(ctx, 'context-diet: tokenMeter.estimateMessage unavailable; skipping the diet pass')
-    }
-    return 0
-  }
-  const limit = Math.max(0, Math.min(plans.length, policy.maxPerPass))
-  let applied = 0
-
-  for (let index = 0; index < limit; index += 1) {
-    if (signal !== undefined && signal.aborted) break
-    const plan = plans[index]
-    if (plan === undefined) continue
-
-    // Re-read: an earlier replacement (ours or compaction's) may have moved the
-    // surface; a stale plan is skipped rather than forced.
-    const event = session.eventAt(plan.seq)
-    if (event === undefined || event.type !== 'tool/result') continue
-    const message = session.deriveEventMessage(event)
-    if (message === null || message === undefined) continue
-    if (isStubbed(Array.isArray(message.content) ? message.content : [])) continue
-    // Never grow a result: a stub whose previews exceed the original is not a diet.
-    if (plan.charsAfter >= plan.charsBefore) continue
-
-    try {
-      const generation = session.surface.replaceGeneration
-      const priced = typeof meter?.estimateMessage === 'function'
-        ? meter.estimateMessage(message)
-        : 0
-      const shadowedTokenCount = Number.isFinite(priced) ? priced : 0
-      // Shadow-price protocol: the claim MUST be appended synchronously before
-      // its replacement, so pure projection consumers can subtract it.
-      session.append('compaction/prune', {
-        shadowedRange: { start: plan.seq, end: plan.seq },
-        shadowedSeqs: [plan.seq],
-        shadowedTokenCount,
-      })
-      session.append(
-        'tool/result',
-        { ...event.data, message: { ...message, content: plan.content } },
-        {
-          surfaceOp: { op: 'replace', startSeq: plan.seq, endSeq: plan.seq },
-          sourceEventSeqs: [plan.seq],
-        },
-      )
-      applied += 1
-      state.appends += 1
-      if (session.surface.replaceGeneration <= generation) {
-        // Defensive: a landed replacement must advance the generation. If it did
-        // not, stop instead of re-planning against an unchanged surface.
-        warn(ctx, 'context-diet: replacement landed without a surface generation change')
-        break
-      }
-    } catch (error) {
-      state.failures += 1
-      warn(ctx, `context-diet: replacement rejected at seq ${plan.seq}: ${String(error)}`)
-      break
-    }
-  }
-
-  state.passes += 1
-  state.lastPass = { at: Date.now(), planned: plans.length, applied }
-  return applied
-}
-
-/** Minimal Standard-Schema-shaped validator for the projection state. */
-function createStateSchema() {
-  const check = (value) => value !== null
-    && typeof value === 'object'
-    && !Array.isArray(value)
-    && typeof value.elided === 'number'
-    && typeof value.refetched === 'number'
-    && Array.isArray(value.signatures)
-    && Array.isArray(value.pending)
-  const parse = (value) => {
-    if (!check(value)) throw new TypeError('contextDiet projection state is malformed')
-    return value
-  }
-  return {
-    parse,
-    '~standard': {
-      version: 1,
-      vendor: 'dsh-context-diet',
-      validate: (value) => (check(value) ? { value } : { issues: [{ message: 'malformed contextDiet state' }] }),
-    },
-  }
-}
-
-function initProjectionState() {
-  return { elided: 0, refetched: 0, signatures: [], pending: [], tools: {} }
-}
-
-/** Signature used for the re-fetch counter: exact tool name + arguments. */
-function callSignature(event) {
-  const data = event.data
-  if (data === undefined || typeof data.name !== 'string') return undefined
-  return `${data.name}\u0000${typeof data.arguments === 'string' ? data.arguments : ''}`
-}
-
-/**
- * Pure, synchronous fold behind the durable counters. A landed stub is detected
- * by its marker; a later call with the same signature counts as a re-fetch.
- * @param state - previous state (never mutated).
- * @param event - one committed session event.
- * @returns the next state, or the same reference when uninterested.
- */
-function foldProjection(state, event) {
-  if (event.type === 'tool/call') {
-    const signature = callSignature(event)
-    if (signature === undefined) return state
-    const name = event.data.name
-    const pending = [...state.pending, { id: String(event.data.callId ?? ''), signature }].slice(-MAX_TRACKED)
-    if (!state.signatures.includes(signature)) return { ...state, pending }
-    return {
-      ...state,
-      pending,
-      refetched: state.refetched + 1,
-      tools: { ...state.tools, [name]: (state.tools[name] ?? 0) + 1 },
-    }
-  }
-  if (event.type === 'tool/result' && event.surfaceOp !== 'append') {
-    const message = event.data === undefined ? undefined : event.data.message
-    const blocks = message === undefined ? undefined : message.content
-    if (!Array.isArray(blocks) || !isStubbed(blocks)) return state
-    const callId = String(message.source?.callId ?? '')
-    const entry = state.pending.find((item) => item.id === callId)
-    if (entry === undefined) return { ...state, elided: state.elided + 1 }
-    if (state.signatures.includes(entry.signature)) return { ...state, elided: state.elided + 1 }
-    return {
-      ...state,
-      elided: state.elided + 1,
-      signatures: [...state.signatures, entry.signature].slice(-MAX_TRACKED),
-    }
-  }
-  return state
-}
-
-/** Conservative policy used when `core.resolvePolicy` cannot answer. */
-const FALLBACK_POLICY = Object.freeze({
-  enabled: false,
-  agePolicy: 'off',
-  coldTtlMinutes: 5,
-  keepTurns: 20,
-  minChars: 1500,
-  stubTailLines: 3,
-  stubErrorLines: 3,
-  maxPerPass: 8,
-  neverElide: [],
+/** @returns {Stats} */
+const emptyStats = () => ({
+  lastCount: 0,
+  lastArgCount: 0,
+  lastChars: 0,
+  cumulativeChars: 0,
+  requests: 0,
+  coldStarts: 0,
+  lastPassAt: 0,
 })
 
-function currentConfig(config) {
-  const source = config !== null && typeof config === 'object' ? config : {}
-  const value = {}
-  for (const key of [
-    'enabled', 'agePolicy', 'coldTtlMinutes', 'keepTurns', 'minChars',
-    'stubTailLines', 'stubErrorLines', 'maxPerPass', 'neverElide',
-  ]) {
-    const field = source[key]
-    value[key] = field !== null && typeof field === 'object' && typeof field.get === 'function'
-      ? field.get()
-      : field
-  }
-  return value
+/** @param {unknown} value @returns {number} */
+function num(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
-/** Resolve the live plugin config plus per-session command overrides into one
- * policy. Volatile Config values are stable references; read their current snapshot
- * for every operation so Settings edits take effect without plugin remount.
+/**
+ * Resolve an optional Cordis service without throwing when the composition has
+ * no provider for it.
+ * @param {object} ctx
+ * @param {string} key
+ * @returns {any}
  */
-function policyFor(config, state) {
+function service(ctx, key) {
   try {
-    return resolvePolicy(currentConfig(config), state === undefined ? undefined : state.overrides)
-  } catch (error) {
-    return FALLBACK_POLICY
-  }
-}
-
-/** Stats for `status`/`show`: the projection is optional. */
-function statsOf(ctx, agent) {
-  const projections = service(ctx, 'sessionProjections')
-  if (projections === undefined || typeof projections.stateOf !== 'function') return undefined
-  try {
-    return projections.stateOf(agent.session, PROJECTION_KEY)
+    if (typeof ctx.get === 'function') return ctx.get(key)
+    return ctx[key]
   } catch {
     return undefined
   }
 }
 
 /**
- * Append the recovery meter's current protection verdict to a status line.
- * Neutral (and byte-identical) when nothing is protected.
- * @param text - base status text.
- * @param state - per-session runtime state.
- * @returns text, with `protected=<tool,…>` when tools are protected.
+ * @param {object} ctx
+ * @param {string} message
  */
-function withProtection(text, state) {
-  const protectedTools = state === undefined ? undefined : state.protectedTools
-  if (!(protectedTools instanceof Set) || protectedTools.size === 0) return text
-  return `${text} protected=${[...protectedTools].join(',')}`
+function warn(ctx, message) {
+  try {
+    if (typeof ctx.logger?.warn === 'function') ctx.logger.warn(message)
+    else if (typeof console !== 'undefined') console.warn(message)
+  } catch {
+    /* a logger must never break the plugin */
+  }
 }
 
-/**
- * `/context-diet` command handler. Every subcommand answers through the command
- * result text; nothing here starts a model turn.
- * @param ctx - plugin context (for optional compaction/service access).
- * @param config - live plugin config.
- * @returns the command handler.
- */
-function createCommandHandler(ctx, config) {
-  return (invocation) => {
-    const agent = invocation.agent
-    const state = sessionState(agent.session)
-    const policy = policyFor(config, state)
-    const command = parseCommand(typeof invocation.rawInput === 'string' ? invocation.rawInput : '')
+// ---------------------------------------------------------------------------
+// DSH ↔ pi message translation
+// ---------------------------------------------------------------------------
 
-    switch (command.kind) {
-      case 'on':
-      case 'off':
-        state.overrides = { ...state.overrides, enabled: command.kind === 'on' }
-        return { kind: 'success', text: `context-diet ${command.kind}` }
-      case 'now':
-        state.forceOnce = true
-        return { kind: 'success', text: 'context-diet: next pre-step elides eligible results' }
-      case 'keep':
-        state.overrides = { ...state.overrides, keepTurns: command.turns }
-        return { kind: 'success', text: `context-diet: keepTurns=${command.turns}` }
-      case 'ttl':
-        state.overrides = { ...state.overrides, coldTtlMinutes: command.minutes }
-        return { kind: 'success', text: `context-diet: coldTtlMinutes=${command.minutes} (approximate)` }
-      case 'mode':
-        state.overrides = { ...state.overrides, agePolicy: command.mode }
-        return { kind: 'success', text: `context-diet: agePolicy=${command.mode}` }
-      case 'args':
-        return {
-          kind: 'error',
-          text: 'context-diet: write/edit argument elision is not expressible on the DSH surface',
+/**
+ * Translate one DSH content block into the pi-shaped block the core expects.
+ *
+ * The structural differences that matter to the core are the tool-call block
+ * discriminator (`tool-call` vs `toolCall`), its JSON-string arguments, and
+ * reasoning blocks, which pi calls `thinking` and must never rewrite.
+ * @param {any} block
+ * @returns {any}
+ */
+function toPiBlock(block) {
+  if (block === null || typeof block !== 'object') return block
+  if (block.type === 'tool-call') {
+    let args = {}
+    try {
+      const parsed = typeof block.arguments === 'string' ? JSON.parse(block.arguments) : block.arguments
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) args = parsed
+    } catch {
+      /* a malformed argument string still identifies the call: {} is enough */
+    }
+    return { type: 'toolCall', id: block.id, name: block.name, arguments: args }
+  }
+  if (block.type === 'reasoning') return { type: 'thinking', text: block.text }
+  return block
+}
+
+
+/**
+ * Build the pi-shaped message list for the current surface, plus the indexes the
+ * adapter needs to land replacements.
+ *
+ * Messages come from the *surface* (so a landed stub is visible and skipped by
+ * `isStubbed`), while timestamps come from the event that owns each node, which
+ * is what pi's cold check reads.
+ * @param {object} session
+ * @returns {{ messages: any[], calls: Map<string, object>, resultSeq: Map<string, number>, assistantSeq: Map<string, number> }}
+ */
+function readSurface(session) {
+  /** @type {any[]} */
+  const messages = []
+  /** @type {Map<string, { name: string, args: Record<string, unknown> }>} */
+  const calls = new Map()
+  /** @type {Map<string, number>} */
+  const resultSeq = new Map()
+  /** @type {Map<string, number>} */
+  const assistantSeq = new Map()
+
+  const nodes = session?.surface?.nodes
+  if (nodes === undefined || nodes === null) return { messages, calls, resultSeq, assistantSeq }
+
+  for (const seq of nodes) {
+    let event
+    try {
+      event = session.eventAt(seq)
+    } catch {
+      continue
+    }
+    if (event === undefined || event === null) continue
+    const type = event.type
+    if (type !== 'tool/result' && type !== 'assistant/message') continue
+    let message
+    try {
+      message = session.deriveEventMessage(event)
+    } catch {
+      message = undefined
+    }
+    if (message === undefined || message === null) continue
+
+    const content = Array.isArray(message.content) ? message.content.map(toPiBlock) : message.content
+
+    if (type === 'assistant/message') {
+      if (typeof message.id === 'string') assistantSeq.set(message.id, seq)
+      for (const part of Array.isArray(content) ? content : []) {
+        if (part?.type === 'toolCall' && typeof part.id === 'string') {
+          calls.set(part.id, { name: part.name, args: part.arguments ?? {} })
         }
-      case 'compact': {
-        const compaction = service(ctx, 'compaction')
-        if (compaction === undefined || typeof compaction.compactNow !== 'function') {
-          return {
-            kind: 'error',
-            text: 'context-diet: compaction service is not visible from the host plane (preset realm)',
+      }
+    } else if (typeof message.toolCallId === 'string') {
+      resultSeq.set(message.toolCallId, seq)
+    }
+
+    messages.push({
+      ...message,
+      content,
+      role: message.role === 'tool' ? 'toolResult' : message.role,
+      timestamp: typeof event.time === 'number' ? event.time : undefined,
+      toolName: typeof message.toolCallId === 'string' ? calls.get(message.toolCallId)?.name : undefined,
+    })
+  }
+
+  // A result may appear before the assistant message that produced it in a
+  // repaired surface; label those in a second pass instead of dropping them.
+  for (const message of messages) {
+    if (message.role !== 'toolResult' || message.toolName !== undefined) continue
+    const call = calls.get(message.toolCallId)
+    if (call !== undefined) message.toolName = call.name
+  }
+
+  return { messages, calls, resultSeq, assistantSeq }
+}
+
+// ---------------------------------------------------------------------------
+// Log observation: recovery meter, calibration, compaction lock
+// ---------------------------------------------------------------------------
+
+/**
+ * Fold the session's new durable events into the adapter state.
+ *
+ * pi's recovery meter hooks `tool_call` directly; DSH has no equivalent event,
+ * so the same signal is derived from the log: a `tool/call` whose signature
+ * matches an elided result is a re-fetch. Counting is idempotent per call id,
+ * exactly like pi's meter.
+ * @param {object} session
+ * @param {object} state
+ * @param {object} config
+ */
+function observeLog(session, state, config) {
+  let events
+  try {
+    events = session.ownEvents()
+  } catch {
+    return
+  }
+  if (!Array.isArray(events)) return
+  for (let i = state.cursor; i < events.length; i += 1) {
+    const event = events[i]
+    const type = event?.type
+    if (type === 'compaction/start') {
+      state.compactionOpen = true
+      continue
+    }
+    if (type === 'compaction/end') {
+      state.compactionOpen = false
+      continue
+    }
+    if (type === 'tool/call') {
+      const data = event.data ?? {}
+      let args = {}
+      try {
+        const parsed = typeof data.arguments === 'string' ? JSON.parse(data.arguments) : data.arguments
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) args = parsed
+      } catch {
+        /* keep {} */
+      }
+      if (typeof data.callId === 'string' && typeof data.name === 'string') {
+        if (state.calls.size < MAX_CALL_INDEX) state.calls.set(data.callId, { name: data.name, args })
+        const hit = state.meter.onCall(data.name, args)
+        if (hit !== undefined && config.autoProtect && !state.protectedTools.has(hit.tool)) {
+          if (state.meter.shouldProtect(hit.tool, config.recoveryThreshold, 5)) {
+            state.protectedTools.add(hit.tool)
           }
         }
-        if (command.action === 'on' || command.action === 'off') {
-          state.overrides = { ...state.overrides, autoCompact: command.action === 'on' }
-          return { kind: 'success', text: `context-diet: autoCompact=${command.action}` }
-        }
-        const run = compaction.compactNow(agent, new AbortController().signal)
-        if (run && typeof run.catch === 'function') {
-          run.catch((error) => warn(ctx, `context-diet: compact failed: ${String(error)}`))
-        }
-        return { kind: 'success', text: 'context-diet: compaction requested' }
       }
-      case 'show': {
-        const text = statusText({
-          policy,
-          overrides: state.overrides,
-          stats: statsOf(ctx, agent),
-          lastPass: state.lastPass,
-          detailed: true,
-        })
-        return { kind: 'success', text: withProtection(text, state) }
-      }
-      case 'invalid':
-        return {
-          kind: 'error',
-          text: command.message ?? 'usage: /context-diet [status|on|off|now|keep n|ttl min|mode|show]',
-        }
-      case 'status':
-      default: {
-        const text = statusText({
-          policy,
-          overrides: state.overrides,
-          stats: statsOf(ctx, agent),
-          lastPass: state.lastPass,
-        })
-        return { kind: 'success', text: withProtection(text, state) }
+      continue
+    }
+    if (type === 'assistant/message') {
+      const usage = event.data?.usage
+      if (usage !== undefined && usage !== null && state.pendingChars > 0) {
+        const tokens = num(usage.inputTokens) + num(usage.cacheReadTokens) + num(usage.cacheWriteTokens)
+        if (tokens > 0) state.calibrator.add(state.pendingChars, tokens)
+        state.pendingChars = 0
       }
     }
+  }
+  state.cursor = events.length
+}
+
+// ---------------------------------------------------------------------------
+// The pass
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {object} session
+ * @param {number} seq
+ * @returns {any}
+ */
+function safeEventAt(session, seq) {
+  try {
+    return session.eventAt(seq)
+  } catch {
+    return undefined
   }
 }
 
 /**
- * Mount the policy plugin.
- *
- * @param ctx - the plugin context.
- * @param config - validated plugin config (may be absent in focused tests).
+ * @param {object} session
+ * @param {any} event
+ * @returns {any}
  */
-export function apply(ctx, config) {
-  const live = config === undefined || config === null ? {} : config
+function safeDerive(session, event) {
+  try {
+    return session.deriveEventMessage(event) ?? null
+  } catch {
+    return null
+  }
+}
 
-  // 1) Durable counters (optional service: degrade to no counters).
-  const projections = service(ctx, 'sessionProjections')
-  if (projections !== undefined && typeof projections.register === 'function') {
-    // The service registers on its own fiber, so bind the returned disposer to
-    // ours; otherwise the unit would outlive this plugin across unload/HMR.
-    const mountProjection = () => {
-      try {
-        return projections.register({
-          key: PROJECTION_KEY,
-          stateSchema: createStateSchema(),
-          init: initProjectionState,
-          apply: foldProjection,
-          stateVersion: PROJECTION_VERSION,
-        })
-      } catch (error) {
-        warn(ctx, `context-diet: projection unavailable: ${String(error)}`)
-        return undefined
-      }
+/**
+ * Append the platform's shadow price for a node that is about to be replaced.
+ *
+ * This is the native tool-result pruner's convention: a log-only
+ * `compaction/prune` record that lets token projections subtract the shadowed
+ * node instead of counting the original *and* its replacement. It summarises
+ * nothing and deletes nothing — the plugin has no compaction behaviour.
+ * @param {object} ctx
+ * @param {object} session
+ * @param {number} seq
+ * @param {any} message
+ */
+function appendShadowPrice(ctx, session, seq, message) {
+  const meter = service(ctx, 'tokenMeter')
+  let tokens = 0
+  try {
+    if (typeof meter?.estimateMessage === 'function') {
+      const priced = meter.estimateMessage(message)
+      if (Number.isFinite(priced)) tokens = priced
     }
-    if (ctx.effect) ctx.effect(mountProjection)
-    else mountProjection()
+  } catch {
+    tokens = 0
+  }
+  // A 0-token claim would make the projection add the stub on top of the
+  // original price. The replacement itself is still safe (the stub is strictly
+  // smaller), so skip the claim rather than assert a wrong number.
+  if (tokens <= 0) return
+  try {
+    session.append('compaction/prune', {
+      shadowedRange: { start: seq, end: seq },
+      shadowedSeqs: [seq],
+      shadowedTokenCount: tokens,
+    })
+  } catch {
+    /* advisory: never block a replacement for the price record */
+  }
+}
+
+
+/**
+ * Decide, then land the replacements durably.
+ * @param {object} ctx
+ * @param {object} agent
+ * @param {object} state
+ * @param {object} config
+ * @param {{ force?: boolean, signal?: AbortSignal }} [options]
+ * @returns {number} landed surface nodes
+ */
+function runPass(ctx, agent, state, config, options = {}) {
+  const session = agent?.session
+  if (session === undefined || session === null) return 0
+
+  observeLog(session, state, config)
+  if (state.compactionOpen) return 0
+
+  const force = options.force === true || state.force === true
+  const { messages, calls, resultSeq, assistantSeq } = readSurface(session)
+  if (messages.length === 0) return 0
+
+  state.calls = calls
+  state.resultSeq = resultSeq
+  state.assistantSeq = assistantSeq
+  state.lastMessages = messages
+
+  const decision = decide(messages, state.elided, config, { now: Date.now(), force }, {
+    elidedArgs: state.elidedArgs,
+    protectedTools: state.protectedTools,
+  })
+
+  if (decision.ids.length === 0 && decision.argIds.length === 0) {
+    // pi clears the per-request savings when nothing elided is in this request
+    // any more (a compaction may have replaced the surface under us), so the
+    // footer never advertises savings that are no longer real.
+    const live = messages.filter((m) => m.role === 'toolResult' && isStubbed(m.content)).length
+    if (live === 0) {
+      state.stats.lastCount = 0
+      state.stats.lastArgCount = 0
+      state.stats.lastChars = 0
+    }
+    state.force = false
+    return 0
   }
 
-  // 2) Pre-step policy: observe, replace, and always continue the turn.
-  ctx.on('agent/pre-step', async (payload, next) => {
-    let state
+  const applied = applyElision(messages, new Set(decision.ids), {
+    argIds: new Set(decision.argIds),
+    preview: { tail: config.stubTailLines, errors: config.stubErrorLines },
+  })
+  if (applied.count === 0 && applied.argCount === 0) {
+    state.force = false
+    return 0
+  }
+
+  let landedResults = 0
+  let landedArgs = 0
+
+  // ---- tool results: 1:1 durable replacement ----
+  for (const info of applied.infos) {
+    if (options.signal !== undefined && options.signal.aborted) break
+    const seq = state.resultSeq.get(info.id)
+    if (seq === undefined) continue
+    const next = applied.messages.find((m) => m.role === 'toolResult' && m.toolCallId === info.id)
+    if (next === undefined) continue
+    const event = safeEventAt(session, seq)
+    if (event === undefined) continue
+    const current = safeDerive(session, event)
+    if (current === null || isStubbed(current.content)) continue
     try {
-      const agent = payload === undefined ? undefined : payload.agent
-      const signal = payload === undefined ? undefined : payload.signal
-      if (agent === undefined || agent.session === undefined) return next()
-      if (signal !== undefined && signal.aborted) return next()
-      state = sessionState(agent.session)
-      // Keep the compaction lock, call index and recovery meter current even
-      // while the policy is off, so toggling it on does not start cold.
-      scanLog(agent.session, state)
-      const policy = policyFor(live, state)
-      const forced = state.forceOnce
-      if (!policy.enabled && !forced) return next()
-      const effective = forced ? { ...policy, enabled: true, agePolicy: 'always' } : policy
-      if (forced) state.forceOnce = false
-      elideStale(ctx, agent, effective, state, signal)
+      appendShadowPrice(ctx, session, seq, current)
+      session.append(
+        'tool/result',
+        { ...event.data, message: { ...current, content: next.content } },
+        { surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq }, sourceEventSeqs: [seq] },
+      )
+      state.elided.add(info.id)
+      landedResults += 1
     } catch (error) {
-      // Fail-open: a policy error must never break the turn.
-      if (state !== undefined) state.failures += 1
+      warn(ctx, `context-diet: replacement rejected at seq ${seq}: ${String(error)}`)
+      break
+    }
+  }
+
+  // Write/edit argument elision is not expressible on this platform: see the
+  // Config comment. `applyElision` never receives argIds, so `landedArgs` stays
+  // 0 and the statistics report results only.
+
+  if (landedResults + landedArgs === 0) {
+    state.force = false
+    return 0
+  }
+
+  state.meter.track(applied.infos)
+  state.stats.requests += 1
+  state.stats.lastCount = landedResults
+  state.stats.lastArgCount = landedArgs
+  state.stats.lastChars = applied.savedChars
+  state.stats.cumulativeChars += applied.savedChars
+  state.stats.lastPassAt = Date.now()
+  if (decision.cold) state.stats.coldStarts += 1
+  state.pendingChars = charsOfMessages(applied.messages)
+  state.force = false
+  return landedResults + landedArgs
+}
+
+// ---------------------------------------------------------------------------
+// Footer / stats
+// ---------------------------------------------------------------------------
+
+/** @param {object} state */
+function recoveryOf(state) {
+  return {
+    recovered: state.meter.recovered,
+    elided: state.meter.elided(),
+    recoveredChars: state.meter.recoveredChars,
+    protectedTools: [...state.protectedTools].sort(),
+  }
+}
+
+/** @param {object} state */
+function calibratorExtra(state) {
+  return {
+    charsPerToken: state.calibrator.charsPerToken(),
+    samples: state.calibrator.samples(),
+    measured: state.calibrator.isMeasured(),
+  }
+}
+
+/**
+ * Render the footer exactly the way pi's `showStatus` does.
+ * @param {object} state
+ * @param {object} config
+ * @returns {string}
+ */
+function renderFooter(state, config) {
+  const cpt = state.calibrator.charsPerToken()
+  let next = 0
+  if (state.stats.lastCount + state.stats.lastArgCount === 0 && state.lastMessages.length > 0) {
+    try {
+      next = staleTokens(
+        state.lastMessages,
+        policyOf(config, state.protectedTools),
+        state.elided,
+        state.elidedArgs,
+        config.elideArgs,
+        cpt,
+      )
+    } catch {
+      next = 0
+    }
+  }
+  return footerLine(config, state.stats, recoveryOf(state), {
+    ...calibratorExtra(state),
+    next,
+  })
+}
+
+/** @param {object} state @param {object} config */
+function refreshFooter(state, config) {
+  try {
+    state.footer = renderFooter(state, config)
+  } catch {
+    state.footer = ''
+  }
+}
+
+/**
+ * @param {object} state
+ * @param {object} config
+ * @returns {object} the JSON served to the Client
+ */
+function statsPayload(state, config) {
+  return {
+    schemaVersion: 1,
+    config,
+    stats: { ...state.stats },
+    recovery: recoveryOf(state),
+    estimate: calibratorExtra(state),
+    footer: state.footer,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mount
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {object} ctx
+ * @param {Record<string, unknown>} [config]
+ */
+export function apply(ctx, config) {
+  const base = config ?? {}
+
+  /** session → adapter state. WeakMap: a finished session is collectable. */
+  const sessions = new WeakMap()
+  /** sessionId → { session, state }, bounded, for the stats endpoint. */
+  const byId = new Map()
+
+  /**
+   * @param {object} session
+   * @returns {object}
+   */
+  function stateOf(session) {
+    const existing = sessions.get(session)
+    if (existing !== undefined) return existing
+    const state = {
+      /** ownEvents() entries already folded (recovery + calibration + lock). */
+      cursor: 0,
+      /** toolCallId → { name, args } as the original call. */
+      calls: new Map(),
+      /** toolCallId → the surface seq that currently holds its result. */
+      resultSeq: new Map(),
+      /** assistant message id → surface seq, for write/edit argument replacement. */
+      assistantSeq: new Map(),
+      /** callIds already replaced (pi's `elided` set). */
+      elided: new Set(),
+      /** callIds whose write/edit arguments were replaced. */
+      elidedArgs: new Set(),
+      /** tools protected for the rest of the session by the recovery meter. */
+      protectedTools: new Set(),
+      meter: new RecoveryMeter(),
+      calibrator: new Calibrator(),
+      stats: emptyStats(),
+      /** Characters of the request the provider is answering (calibration). */
+      pendingChars: 0,
+      /** Set by `/context-diet now`. */
+      force: false,
+      /** Session-scoped overrides (never persisted; DSH keeps config in the profile). */
+      overrides: {},
+      /** A native compaction bracket is open: do not touch the surface. */
+      compactionOpen: false,
+      /** pi-shaped snapshot of the last pass, for the footer's next-pause budget. */
+      lastMessages: [],
+      /** Last rendered footer text ('' when the plugin has nothing to say). */
+      footer: '',
+      /** Monotonic use counter, so eviction drops the least recently active entry. */
+      used: 0,
+    }
+    sessions.set(session, state)
+    const id = session?.id
+    if (typeof id === 'string' && id.length > 0) {
+      byId.delete(id)
+      byId.set(id, { session, state })
+      while (byId.size > MAX_TRACKED_SESSIONS) {
+        const oldest = byId.keys().next().value
+        if (oldest === undefined) break
+        byId.delete(oldest)
+      }
+    }
+    return state
+  }
+
+  /** @returns {{ session: any, state: object } | undefined} */
+  function latest() {
+    let best
+    for (const entry of byId.values()) {
+      if (best === undefined || entry.state.used >= best.state.used) best = entry
+    }
+    return best
+  }
+
+  // 1) The policy pass: observe, decide, land replacements, always continue.
+  ctx.on('agent/pre-step', async (payload, next) => {
+    try {
+      const agent = payload?.agent
+      if (agent?.session !== undefined && agent.session !== null) {
+        const state = stateOf(agent.session)
+        state.used += 1
+        const cfg = adapterConfig(base, state.overrides)
+        if (payload?.signal?.aborted !== true) {
+          runPass(ctx, agent, state, cfg, { signal: payload?.signal })
+          refreshFooter(state, cfg)
+        }
+      }
+    } catch (error) {
       warn(ctx, `context-diet: pre-step failed open: ${String(error)}`)
     }
     return next()
   })
 
-  // 3) Drop per-session runtime state with the agent.
-  ctx.on('agent/disposed', ({ agent }) => {
+  // 2) A disposed agent releases its endpoint entry (the WeakMap collects the
+  //    state by itself once the session is gone).
+  ctx.on('agent/disposed', (event = {}) => {
     try {
-      if (agent !== undefined && agent.session !== undefined) sessions.delete(agent.session)
+      const session = event?.agent?.session
+      if (session === undefined || session === null) return
+      sessions.delete(session)
+      const id = session.id
+      if (typeof id === 'string') byId.delete(id)
     } catch {
       /* best effort */
     }
   })
 
-  // 4) Human surface (optional service: degrade to no command).
+  // 3) The human surface: `/context-diet …`.
   const commands = service(ctx, 'commands')
   if (commands !== undefined && typeof commands.register === 'function') {
     const mount = () => {
       try {
         const dispose = commands.register({
           name: 'context-diet',
-          description: 'Inspect or tune stale tool-result elision for this session.',
-          handler: createCommandHandler(ctx, live),
+          description: 'Show and tune stale tool-result elision for this session.',
+          handler: createCommandHandler(ctx, base, stateOf, (session) => {
+            const state = stateOf(session)
+            state.used += 1
+            return state
+          }),
         })
         return typeof dispose === 'function' ? dispose : undefined
       } catch (error) {
@@ -701,8 +718,234 @@ export function apply(ctx, config) {
         return undefined
       }
     }
-    if (ctx.effect) ctx.effect(mount)
+    if (typeof ctx.effect === 'function') ctx.effect(mount)
     else mount()
   }
 
+  // 4) The read-only stats endpoint that feeds the Client footer.
+  if (typeof ctx.inject === 'function') {
+    try {
+      ctx.inject(['webServer'], (webCtx) => {
+        mountStatsRoute(webCtx, base, latest, byId)
+      })
+    } catch (error) {
+      warn(ctx, `context-diet: stats route unavailable: ${String(error)}`)
+    }
+  }
+}
+
+/**
+ * @param {object} webCtx
+ * @param {Record<string, unknown>} base
+ * @param {() => ({ session: any, state: object } | undefined)} latest
+ * @param {Map<string, { session: any, state: object }>} byId
+ */
+function mountStatsRoute(webCtx, base, latest, byId) {
+  webCtx.effect(
+    () =>
+      webCtx.webServer.register({
+        kind: 'exact',
+        path: STATS_ENDPOINT,
+        handler: (req, res) => {
+          if (req.method !== 'GET' && req.method !== 'HEAD') {
+            res.writeHead(405, { allow: 'GET, HEAD', 'cache-control': 'no-store' })
+            res.end()
+            return
+          }
+          const rejection = rejectionFor(webCtx, req)
+          if (rejection !== undefined) {
+            sendJson(res, rejection, {
+              code: rejection === 403 ? 'forbidden' : 'unauthenticated',
+              message: rejection === 403
+                ? 'the request did not come from a trusted origin'
+                : 'dsh web authentication required',
+            }, req.method === 'HEAD')
+            return
+          }
+          const entry = resolveEntry(req, latest, byId)
+          if (entry === undefined) {
+            sendJson(res, 200, {
+              schemaVersion: 1,
+              sessionId: null,
+              config: adapterConfig(base),
+              stats: emptyStats(),
+              recovery: { recovered: 0, elided: 0, recoveredChars: 0, protectedTools: [] },
+              estimate: { charsPerToken: 3, samples: 0, measured: false },
+              footer: '',
+            }, req.method === 'HEAD')
+            return
+          }
+          const cfg = adapterConfig(base, entry.state.overrides)
+          refreshFooter(entry.state, cfg)
+          sendJson(
+            res,
+            200,
+            { sessionId: entry.session?.id ?? null, ...statsPayload(entry.state, cfg) },
+            req.method === 'HEAD',
+          )
+        },
+      }),
+    'context-diet: stats route',
+  )
+}
+
+/**
+ * Pick the session the footer describes: an explicit `sessionId` query wins,
+ * otherwise the most recently active one.
+ * @param {any} req
+ * @param {() => ({ session: any, state: object } | undefined)} latest
+ * @param {Map<string, { session: any, state: object }>} byId
+ * @returns {{ session: any, state: object } | undefined}
+ */
+function resolveEntry(req, latest, byId) {
+  try {
+    const url = new URL(req.url ?? '/', 'http://localhost')
+    const wanted = url.searchParams.get('sessionId')
+    if (typeof wanted === 'string' && wanted.length > 0) return byId.get(wanted)
+  } catch {
+    /* fall through to the most recently active session */
+  }
+  return latest()
+}
+
+/**
+ * @param {object} webCtx
+ * @param {any} req
+ * @returns {number | undefined} 401/403 when the request is not admitted
+ */
+function rejectionFor(webCtx, req) {
+  const connection = service(webCtx, 'connection')
+  if (typeof connection?.requestRejection !== 'function') return undefined
+  try {
+    return connection.requestRejection(req)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * @param {any} res
+ * @param {number} status
+ * @param {unknown} value
+ * @param {boolean} [head]
+ */
+function sendJson(res, status, value, head = false) {
+  const body = JSON.stringify(value)
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'content-length': String(Buffer.byteLength(body)),
+  })
+  res.end(head ? undefined : body)
+}
+
+/**
+ * `/context-diet` handler.
+ *
+ * Command changes are session-scoped on purpose: DSH keeps plugin
+ * configuration in the profile Config (edited through the Loader), so a command
+ * never rewrites it, and a command therefore never reloads the plugin under the
+ * user's feet.
+ * @param {object} ctx
+ * @param {Record<string, unknown>} base
+ * @param {(session: any) => object} stateOf
+ * @param {(session: any) => object} touch
+ * @returns {(input: any) => any}
+ */
+function createCommandHandler(ctx, base, stateOf, touch) {
+  return (input) => {
+    try {
+      const agent = input?.agent ?? input?.session?.agent
+      const session = agent?.session ?? input?.session
+      const state = session === undefined || session === null ? undefined : touch(session)
+      const argText = typeof input?.args === 'string' ? input.args : (input?.text ?? '')
+      const command = parseCommand(argText)
+      const config = state === undefined ? adapterConfig(base) : adapterConfig(base, state.overrides)
+
+      if (command.kind === 'invalid') return { kind: 'error', text: `context-diet: ${command.message}` }
+
+      if (command.kind === 'status') {
+        return {
+          kind: 'success',
+          text: state === undefined
+            ? statusLine(config, emptyStats())
+            : statusLine(config, state.stats, recoveryOf(state), calibratorExtra(state)),
+        }
+      }
+
+      if (command.kind === 'show') {
+        if (state === undefined) return { kind: 'success', text: 'context-diet: no active session' }
+        const messages = state.lastMessages
+        const elided = describeElided(messages, state.elided, state.elidedArgs)
+        const candidates = describeCandidates(
+          messages,
+          policyOf(config, state.protectedTools),
+          state.elided,
+          state.elidedArgs,
+          config.elideArgs,
+        )
+        const cpt = state.calibrator.charsPerToken()
+        const text = [
+          ...showLines('elided now', elided, 10, cpt),
+          '',
+          ...showLines('next cold start', candidates, 10, cpt),
+        ].join('\n')
+        return { kind: 'success', text: `context-diet:\n${text}` }
+      }
+
+      if (state === undefined) return { kind: 'error', text: 'context-diet: no active session' }
+
+      switch (command.kind) {
+        case 'on':
+          state.overrides = { ...state.overrides, enabled: true }
+          refreshFooter(state, adapterConfig(base, state.overrides))
+          return { kind: 'success', text: 'context-diet: on (this session)' }
+        case 'off':
+          state.overrides = { ...state.overrides, enabled: false }
+          refreshFooter(state, adapterConfig(base, state.overrides))
+          return { kind: 'success', text: 'context-diet: off (this session)' }
+        case 'now':
+          state.force = true
+          return { kind: 'success', text: 'context-diet: eliding stale results on the next step' }
+        case 'keep':
+          state.overrides = { ...state.overrides, keepTurns: command.turns }
+          return { kind: 'success', text: `context-diet: keep last ${command.turns} turns (this session)` }
+        case 'ttl':
+          state.overrides = { ...state.overrides, cacheTtlMinutes: command.minutes }
+          return { kind: 'success', text: `context-diet: cache ttl ${command.minutes} min (this session)` }
+        case 'mode':
+          state.overrides = { ...state.overrides, mode: command.mode }
+          refreshFooter(state, adapterConfig(base, state.overrides))
+          return { kind: 'success', text: `context-diet: mode ${command.mode} (this session)` }
+        case 'args':
+          // Always kept on DSH: the platform rejects the assistant/message
+          // replacement that would be needed. Say so instead of pretending.
+          return {
+            kind: command.on ? 'error' : 'success',
+            text: command.on
+              ? 'context-diet: write/edit argument elision is not expressible on the DSH surface; arguments stay kept'
+              : 'context-diet: write/edit args kept (always on DSH)',
+          }
+        default:
+          return { kind: 'error', text: USAGE }
+      }
+    } catch (error) {
+      warn(ctx, `context-diet: command failed: ${String(error)}`)
+      return { kind: 'error', text: `context-diet: ${String(error?.message ?? error)}` }
+    }
+  }
+}
+
+/** Exported for tests: the adapter's translation and pass contract. */
+export const __testing = {
+  toPiBlock,
+  adapterConfig,
+  readSurface,
+  observeLog,
+  runPass,
+  renderFooter,
+  statsPayload,
+  STATS_ENDPOINT,
+  args: { ARG_TOOLS, callSignature, formatTokens, indexCalls, measure },
 }
