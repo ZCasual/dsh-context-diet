@@ -212,6 +212,12 @@ dsh --profile <profile> --dump-config | grep -A3 dsh-context-diet
 - A node that already carries a replacement or a shadow price is skipped, so this
   plugin and the native pruner never fight over the same node.
 - Behaviour on DSH versions other than the anchor is unverified.
+- A resumed session rebuilds its state with one pass over the log (O(log size)),
+  once per session and again only for `/context-diet show`.
+- The cumulative `y saved` total starts at zero for a new process; a resumed
+  session knows what is elided but not how many requests the previous process saw.
+- An abandoned native compaction bracket older than ten minutes is cleared so a
+  crashed compaction cannot stop elision for the rest of the session.
 
 ## Design notes
 

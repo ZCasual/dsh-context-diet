@@ -255,3 +255,105 @@ node --test test/parity.test.js                       # 105/105
 node /tmp/fid/adversarial.mjs                         # 17/17（脚本见 §4）
 # 说明：本会话 /tmp 每次 bash 调用会重建，需与脚本写入同一次调用运行
 ```
+
+
+---
+
+# 7. 复审结论（第二轮，2026-11-03 02:00–02:20，独立复核）
+
+**方法**：不采信实现者描述，重新读当前 `index.js`（39,620 B）、`core.js`、`README.md`、`client.js`；重跑
+`npm test`（181/181）、`node --test test/parity.test.js`（105/105）、上一轮 5 个对抗用例 + F/G 探针（14/14 通过）、
+新写"重启"脚本（9/9）、fork 脚本、6 样本校准探针、compaction bracket 探针。
+脚本与输出见 §7.3（`/tmp` 每次调用会重建，故内嵌）。
+
+## 7.1 逐项状态
+
+| 项 | 状态 | 我独立验证到的证据 |
+|---|---|---|
+| **P1-1 统计口径** | **已修** | `index.js:559-660`。F 探针：两次冷启动后 `lastCount` 2→**4**（= 当前 surface 全部 stub，不再是"本次落盘增量"）；`cumulativeChars` = saved2+saved4+saved4（**逐请求累加**）；`requests`=3（无新落盘的那次请求也计数）；`coldStarts`=2（只在真正落盘时 +1）；无 stub 归零分支在 `:633-637`，仓库测试 `test/session-contract.test.js:608`（native compaction 场景）覆盖并通过。与 TS:1077-1096 语义等价。 |
+| **P1-2 重启恢复** | **已修（fork 场景仍有缺口，见 N1）** | 新增 `hydrate()` `index.js:295-387`：按日志顺序重放 `tool/result` 替换、`callSignature`、`meter.track/onCall`、`protectedTools`，并 honor 未闭合 `compaction/start`。重启脚本（同 Session、全新 ctx）9/9：`elided` 7 恢复；`recovered` 保持 2（**未把原始调用误计为重取**——原始调用出现在其 stub 之前，因此 hydrate 时 meter 尚未 track）；`protectedTools=['bash']` 恢复，且恢复后不再裁该类结果；`recoveredChars` 有限；未闭合 bracket 跨重启保持、`compaction/end` 后恢复裁剪（探针 PASS）；命令路径重复 hydrate 不重复计数（`recovered/elided` 不变）。 |
+| **P1-3 校准接入** | **已修** | `index.js:430-479`（`assistant/message` 的 usage → `calibrator.add(pendingChars, tokens)`）、`:654`（**每次 pass** 设 `pendingChars = charsOfMessages(nextMessages)`）；`readSurface()` 已纳入 `user/message`、`system/message`（`index.js:236-241`），分母=整请求字符。G 探针：两个请求 → `samples=2`（旧实现第二次 pass 才 1）；6 样本探针（合成 provider 按 chars/3 计费）→ `measured=true, samples=9, charsPerToken=2.9938`，与注入的 3 chars/token 一致。与 TS:1077 + TS:1101-1114 等价。 |
+| **P2-4 `/show` 原文尺寸** | **已修** | 新增 `messagesWithOriginals()` `index.js:388-428`，按 `sourceEventSeqs` 从日志取原文替换 stub；重启脚本 `/show` 显示 `bash echo turn-0 5.9 KB`（原文），不是 stub 的 201 B；仓库测试 `session-contract.test.js:603` 断言重复 `/show` 字节一致。 |
+| **P2-5 README 口径** | **已修** | `README.md:55-56` 现在与实现一致：`−x /req` = 当前 surface 全部 stub 的节省、`y saved` = 逐请求累加的累计值。 |
+| **P2-6 client-ui-slots** | **撤回（上轮判断错误）** | 实现者证据成立并经我复核：`dsh-web-frontend/dist/assets/index-BXV-oxvX.js` 的 baseline module table（`function OZ()`）含 `"@deepseek-ai/dsh-client-ui-slots": jI`——它是 **client baseline module id**，不是 npm 包。旁证：本机 profile 中 `dsh-better-sidebar` 与 `dsh-rewind-plugin` 的 `dsh.client.inject` 都声明该 id 且正常工作。上轮"事实错误"结论作废。 |
+
+## 7.2 本轮新发现
+
+| # | 严重度 | 问题 | 证据 | 建议 |
+|---|---|---|---|---|
+| **N1** | **P2（fork/subagent 场景功能性）** | `hydrate()`/`observeLog()`/`messagesWithOriginals()` 都用 `session.ownEvents()`，它**只返回 child-owned 事件**（不含 fork 继承前缀）。fork 后：继承前缀里的替换不会被重放 → `elided`/`savedByCall`/meter/protectedTools/原文尺寸全部缺失。实测（`fork2.mjs`）：子 Session surface 有 **4 个继承 stub**，但 `/context-diet status` 报 `0 results elided`、recovery `0 of 0`；`/show` 报 `elided now: none`，并把 4 个 stub（201 B）列为 `next cold start: 4 (~268 tokens)` ——应显示 4 条原文（5.9 KB）且不应列为候选。 | `index.js:305,397,431`；`dsh-session` 的 `ownEvents()` 文档："child-owned events after its fork-inherited prefix" + `@deprecated` | 改用 `session.snapshotEvents()`（非 deprecated，含继承前缀），`state.cursor` 改为全日志偏移；或 cursor 从 `session.inheritedEventCount` 起并额外重放 `[0, inheritedEventCount)` 前缀。修后补一个 fork 测试。 |
+| **N2** | P3（API 卫生） | `ownEvents()` 已被 DSH 标记 deprecated（"new calls are prohibited"，见 `dsh-session/lib/types/index.d.ts:224-231`），新代码三处使用；同时每次调用返回**新数组**（O(n) 拷贝）。 | 同上 | 随 N1 一并换到 `snapshotEvents()`。 |
+| **N3** | P3（展示一致性） | `hydrate()` 只种子化 `stats.lastCount/lastChars`（`index.js:369-377`），不种子 `requests/cumulativeChars`。重启后立即 `/status` 会出现 "7 results elided (~13.3k tokens kept out of every request), ~0 tokens saved over 0 requests" 的自相矛盾（上游 resume 后 stats 全空，首个请求才填充）。 | 重启脚本输出（§7.3） | 二选一：不种子 `lastCount`（对齐上游），或同时跳过 "over N requests" 文案；或文档化该瞬态。 |
+| **N4** | P3（成本，非泄漏） | `hydrate` 每个新 session state 全量扫一次；`/show` 每次全量扫；LRU 淘汰（`MAX_TRACKED_SESSIONS=8`，`index.js:108,801`）后重建会重扫。`savedByCall` 每条只存两个数字（符合声明），`state.calls` 上限 8192（`MAX_CALL_INDEX`）。 | 代码审阅 | 超长会话可接受（一次性/用户触发）；如需更低成本，改成投影增量持久化。 |
+| **N5** | nit | 未闭合 `compaction/start` 被如实 honor（这是本轮要求的行为），但若该 bracket 因崩溃永久未闭合，该会话将永久停止裁剪（无超时/无命令清除）。 | bracket 探针 | 可选：给 bracket 加 stale 上限或 `/context-diet reset-lock`。 |
+| — | — | 上轮 P3 残留：`estimateTokens` 未导出、`completions()` 死代码、`force` 在 `messages.length===0` 早退未清（`index.js:575`）、客户端轮询无 in-flight 去重、保护发生无用户提示。 | 代码审阅 | 不阻塞发布，随版本清理。 |
+
+**关于一次瞬时 NaN 的说明（诚实记录）**：我在复审早期的一次运行中观察到重启后 `recoveredChars` 变成 `NaN`（`/status` 显示 `~NaN tokens`）。复核最终文件后**无法复现**：`hydrate()` 的 `meter.track` 已带 `chars`（`index.js:353-360`，注释明确"without it recoveredChars degrades to NaN after a resume"），重启脚本 9/9 中 `recoveredChars` 从 11778 → 17667 均为有限值。判定为编辑中间态的瞬时值，最终状态无此缺陷。
+
+## 7.3 复审脚本（关键片段与结果）
+
+重启/保护/恢复（`/tmp/fid/restart2.mjs`，9/9 通过）：
+
+```js
+// 7 turns with DISTINCT args; keepTurns=1, mode=always
+// pass1 elides results 0..4 (5), then 2 more turns -> pass2 elides 5,6 (7 total)
+// two re-fetches of two different elided signatures -> recovered 2/7 > 0.25 -> protect bash
+const cfg = { enabled: true, mode: 'always', keepTurns: 1, minChars: 200 }
+const h1 = mountPlugin(cfg, { withWebServer: true })
+await h1.emitPreStep(preStep(s), nextEnter())
+...
+appendTurn(s, { turn: 9, callId: 'fetch0', args: args(0) })
+appendTurn(s, { turn: 10, callId: 'fetch1', args: args(1) })
+await h1.emitPreStep(preStep(s), nextEnter())
+// --- restart: same Session, brand-new ctx ---
+const h2 = mountPlugin(cfg, { withWebServer: true })
+const statusAfter = cmd(h2, s, 'status').text   // hydrates through the command path
+```
+
+实测输出（节选）：
+
+```
+before restart: {"recovered":2,"elided":7,"recoveredChars":11778,"protectedTools":["bash"]} lastCount 7 requests 3 cumulative 107996
+after restart : {"recovered":2,"elided":7,"recoveredChars":11778,"protectedTools":["bash"]} lastCount 7 requests 0 cumulative 0
+recovery: 2 of 7 elided results re-fetched (29%, ~3.9k tokens to re-fetch, once) · protected: bash
+PASS hydrate restores elided count / does not miscount originals / restores protectedTools /
+     recoveredChars finite / status shows protected / /show uses original sizes (5.9 KB)
+post-restart re-fetch: {"recovered":3,"elided":7,"recoveredChars":17667,...}  (finite)
+9/9 checks passed
+```
+
+fork 缺口（`/tmp/fid/fork2.mjs`，节选）：
+
+```js
+const boundary = parent.seq - 1
+const seed = buildForkSeed(parent.snapshotEvents(), boundary)
+const child = Session.create('child', seed, { ...draft.header, id: 'child', isSeeded: true, parentSession: parent.id }, boundary + 1)
+// child surface carries 4 inherited stubs
+```
+
+实测输出：
+
+```
+parent stubs: 4 | child inheritedEventCount: 38 | child seq: 41
+child surface stubs: 4 | ownEvents: 3 | snapshotEvents: 41
+child /status: this session: 0 results elided (~0 tokens kept out of every request) ... recovery: 0 of 0
+child /show:   elided now: none / next cold start: 4 (~268 tokens) / bash echo p0  201 B   <- stub size, should be 5.9 KB
+```
+
+校准 6 样本探针（`/tmp/fid/probe2.mjs`，节选）：
+
+```js
+// synthetic provider bills ceil(charsOfRequest / 3) prompt tokens
+s.append('assistant/message', { ..., usage: { inputTokens: Math.ceil(chars / 3), outputTokens: 5 } }, { surfaceOp: 'append' })
+```
+
+实测：`{"charsPerToken":2.993762723645863,"samples":9,"measured":true}` → 分母确为整请求字符。
+
+compaction bracket 探针：`PASS unclosed bracket (live) blocks replacements` / `PASS unclosed bracket survives hydrate` / `PASS bracket close resumes the pass`。
+
+## 7.4 复审后的发布判断
+
+- **P1-1 / P1-3 / P2-4 / P2-5：确认已修**，且我用独立脚本（非仓库测试）复现了等价口径。
+- **P1-2：主路径确认已修**；在 **fork / subagent 会话**上仍有缺口（N1），属"部分修"。
+- **P2-6：撤回**（baseline module id 合法）。
+- 因此"core 是 1:1 移植、适配层差异已界定"的表述在**普通 resume/restart** 场景成立；在 **fork/subagent** 场景需先修 N1 才能说"恢复语义完整"。建议发布前只做 **N1 一处代码修**（`ownEvents` → `snapshotEvents` + cursor 语义）并补一个 fork 测试；N2–N5 可随后清理。

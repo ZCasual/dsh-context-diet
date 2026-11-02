@@ -111,6 +111,12 @@ const MAX_TRACKED_SESSIONS = 8
 const MAX_CALL_INDEX = 8192
 
 /**
+ * A native compaction bracket that stays open this long is treated as abandoned
+ * (the process died inside it) so the session does not stop eliding forever.
+ */
+const STALE_BRACKET_MS = 10 * 60 * 1000
+
+/**
  * @typedef {object} Stats
  * @property {number} lastCount
  * @property {number} lastArgCount
@@ -295,7 +301,7 @@ function readSurface(session) {
 function hydrate(session, state, config) {
   let events
   try {
-    events = session.ownEvents()
+    events = session.snapshotEvents()
   } catch {
     return
   }
@@ -305,14 +311,17 @@ function hydrate(session, state, config) {
   // re-fetch once the replacement it re-fetches has been replayed, exactly as in a
   // live process where `track` happens at the elision and `onCall` after it.
   let bracketOpen = false
+  let bracketSince
   for (const event of events) {
     const type = event?.type
     if (type === 'compaction/start') {
       bracketOpen = true
+      bracketSince = typeof event.time === 'number' ? event.time : Date.now()
       continue
     }
     if (type === 'compaction/end') {
       bracketOpen = false
+      bracketSince = undefined
       continue
     }
     if (type === 'tool/call') {
@@ -362,6 +371,7 @@ function hydrate(session, state, config) {
   }
 
   state.compactionOpen = bracketOpen
+  state.bracketSince = bracketSince
   state.cursor = events.length
   state.hydrated = true
 
@@ -393,7 +403,7 @@ function messagesWithOriginals(session, messages) {
   const originals = new Map()
   let events
   try {
-    events = session.ownEvents()
+    events = session.snapshotEvents()
   } catch {
     return messages
   }
@@ -433,20 +443,24 @@ function messagesWithOriginals(session, messages) {
 function observeLog(session, state, config) {
   let events
   try {
-    events = session.ownEvents()
+    // The full log, including the fork-inherited prefix: a child session inherits
+    // surface nodes it must still account for, and `ownEvents()` would hide them.
+    events = session.snapshotEvents(state.cursor)
   } catch {
     return
   }
   if (!Array.isArray(events)) return
-  for (let i = state.cursor; i < events.length; i += 1) {
+  for (let i = 0; i < events.length; i += 1) {
     const event = events[i]
     const type = event?.type
     if (type === 'compaction/start') {
       state.compactionOpen = true
+      state.bracketSince = typeof event.time === 'number' ? event.time : Date.now()
       continue
     }
     if (type === 'compaction/end') {
       state.compactionOpen = false
+      state.bracketSince = undefined
       continue
     }
     if (type === 'tool/call') {
@@ -478,7 +492,7 @@ function observeLog(session, state, config) {
       }
     }
   }
-  state.cursor = events.length
+  state.cursor += events.length
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +579,13 @@ function runPass(ctx, agent, state, config, options = {}) {
 
   if (state.hydrated !== true) hydrate(session, state, config)
   observeLog(session, state, config)
-  if (state.compactionOpen) return 0
+  if (state.compactionOpen) {
+    const since = typeof state.bracketSince === 'number' ? state.bracketSince : Date.now()
+    if (Date.now() - since < STALE_BRACKET_MS) return 0
+    warn(ctx, 'context-diet: clearing a stale compaction bracket so elision can resume')
+    state.compactionOpen = false
+    state.bracketSince = undefined
+  }
 
   const force = options.force === true || state.force === true
   const { messages, calls, resultSeq, assistantSeq } = readSurface(session)
@@ -789,6 +809,8 @@ export function apply(ctx, config) {
       overrides: {},
       /** A native compaction bracket is open: do not touch the surface. */
       compactionOpen: false,
+      /** When the open bracket started, so an abandoned one can be escaped. */
+      bracketSince: undefined,
       /** pi-shaped snapshot of the last pass, for the footer's next-pause budget. */
       lastMessages: [],
       /** Last rendered footer text ('' when the plugin has nothing to say). */
