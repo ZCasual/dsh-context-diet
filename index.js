@@ -354,6 +354,9 @@ function hydrate(session, state, config) {
         tool: call.name,
         args: call.args,
         sig: callSignature(call.name, call.args),
+        // The meter needs the original size to report how many characters had to
+        // be re-fetched; without it `recoveredChars` degrades to NaN after a resume.
+        chars: original === null ? 0 : measure(original.content).chars,
       }])
     }
   }

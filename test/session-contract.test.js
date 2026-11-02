@@ -15,11 +15,13 @@
 import assert from 'node:assert/strict'
 import { afterEach, beforeEach, test } from 'node:test'
 
+import { charsOfMessages, formatSize, formatTokens, measure } from '../core.js'
 import {
   MIN,
   NOW,
   Session,
   appendTurn,
+  appendUser,
   bigText,
   callRoute,
   freezeClock,
@@ -390,4 +392,265 @@ test('an admitted request from the connection check proceeds normally', async ()
   })
   const { res } = callRoute(h.routes[0], { url: testing.STATS_ENDPOINT })
   assert.equal(res.status, 200)
+})
+
+// ---------------------------------------------------------------------------
+// Statistics semantics, cross-process hydration and whole-request calibration
+// (upstream TS:1077-1096). Added after the P1/P2 audit to lock the fixes.
+// ---------------------------------------------------------------------------
+
+/** Append a system message; the calibration denominator must count it too. */
+function appendSystem(session, chars, id = 'system-0') {
+  return session.append(
+    'system/message',
+    {
+      role: 'system',
+      id,
+      content: [{ type: 'text', text: 's'.repeat(chars) }],
+      source: { kind: 'system' },
+    },
+    { surfaceOp: 'append' },
+  ).seq
+}
+
+/** Append an assistant message carrying provider usage (what observeLog folds). */
+function appendUsage(session, usage, { turn = 10, index = 0 } = {}) {
+  return session.append(
+    'assistant/message',
+    {
+      turn,
+      step: 1,
+      usage,
+      message: {
+        role: 'assistant',
+        id: `usage-${index}`,
+        content: [{ type: 'text', text: `ok ${index}` }],
+        source: { kind: 'model', provider: 'test-provider', model: 'test-model' },
+      },
+      stream: [],
+    },
+    { surfaceOp: 'append' },
+  ).seq
+}
+
+/** A cold three-turn session whose turn-0 result (only) is eligible. */
+function statsSession(id, chars = 6000) {
+  const session = Session.create(id)
+  const results = []
+  for (let turn = 0; turn < 3; turn += 1) {
+    results.push(
+      appendTurn(session, {
+        turn,
+        callId: `${id}-${turn}`,
+        content: [{ type: 'text', text: turn === 0 ? 'x'.repeat(chars) : 'small' }],
+      }),
+    )
+  }
+  return { session, results }
+}
+
+test('A. stats: a warm pass re-reports the whole elided surface and accumulates per request', async () => {
+  const { session } = statsSession('stats-accounting')
+  const h = mountWithRoute()
+  setClock(NOW + 6 * MIN)
+
+  await h.emitPreStep(preStep(session), nextEnter())
+  const pass1 = callRoute(h.routes[0]).json
+  await h.emitPreStep(preStep(session), nextEnter())
+  const pass2 = callRoute(h.routes[0]).json
+
+  // pass 1 landed the one stub: last* describes the whole surface, not the delta.
+  assert.equal(pass1.stats.lastCount, 1)
+  assert.equal(pass1.stats.lastArgCount, 0)
+  assert.ok(pass1.stats.lastChars > 0)
+  assert.equal(pass1.stats.cumulativeChars, pass1.stats.lastChars)
+  assert.equal(pass1.stats.requests, 1)
+
+  // pass 2 landed nothing, yet still reports the same elided surface and
+  // accumulates another request's worth of savings (upstream TS:1086-1091).
+  assert.equal(pass2.stats.lastCount, 1, 'lastCount is the surface total, not this pass')
+  assert.equal(pass2.stats.lastChars, pass1.stats.lastChars)
+  assert.equal(pass2.stats.cumulativeChars, 2 * pass1.stats.lastChars)
+  assert.equal(pass2.stats.requests, 2)
+
+  // The footer accumulates: the /req part is stable, the saved part doubles.
+  const perRequest = formatTokens(Math.round(pass2.stats.lastChars / 3))
+  const cumulative = formatTokens(Math.round(pass2.stats.cumulativeChars / 3))
+  assert.equal(pass2.footer, `🥗 −${perRequest} /req · ${cumulative} saved`)
+  assert.equal(callRoute(h.routes[0]).json.footer, pass2.footer, 'the client polls the same footer')
+})
+
+test('B. restart: a bare /show hydrates original sizes, status says 1 result, cumulative is 0', async () => {
+  const { session } = statsSession('restart-show', 6000)
+  const first = mountWithRoute()
+  setClock(NOW + 6 * MIN)
+  await first.emitPreStep(preStep(session), nextEnter())
+  assert.equal(session.surface.replaceGeneration, 1)
+  first.ctx.dispose()
+
+  // A brand-new apply()/ctx has no WeakMap state: only the log survives.
+  const restarted = mountWithRoute()
+  const show = restarted.registered.command.handler({ agent: { session }, args: 'show' })
+  assert.equal(show.kind, 'success')
+  assert.equal(show.text.includes('elided now: 1'), true, show.text)
+  assert.equal(show.text.includes(`bash ${'echo probe'}  ${formatSize(6000)}`), true, show.text)
+  assert.equal(show.text.includes(formatSize(6000)), true, 'the size shown is the ORIGINAL result size')
+
+  const status = restarted.registered.command.handler({ agent: { session }, args: 'status' })
+  assert.equal(status.kind, 'success')
+  assert.equal(status.text.includes('1 results elided'), true, status.text)
+  assert.equal(status.text.includes('~0 tokens saved over 0 requests'), true, 'this process observed no request yet')
+
+  const payload = callRoute(restarted.routes[0]).json
+  assert.equal(payload.sessionId, 'restart-show')
+  assert.equal(payload.stats.lastCount, 1)
+  assert.equal(payload.stats.requests, 0)
+  assert.equal(payload.stats.cumulativeChars, 0)
+  assert.ok(payload.stats.lastChars > 0, 'the per-request view is seeded from the log')
+})
+
+test('C. hydrate: the call that produced a stub is not a re-fetch; real re-fetches still protect', async () => {
+  const session = Session.create('hydrate-meter')
+  for (let turn = 0; turn < 8; turn += 1) {
+    appendTurn(session, {
+      turn,
+      callId: `h${turn}`,
+      name: 'bash',
+      args: { command: `cat log-${turn}` },
+      content: [{ type: 'text', text: bigText(`h-${turn}`) }],
+    })
+  }
+  const first = mountWithRoute()
+  setClock(NOW + 6 * MIN)
+  await first.emitPreStep(preStep(session), nextEnter())
+  assert.equal(session.surface.replaceGeneration, 6)
+  first.ctx.dispose()
+
+  // Restart: /status is the first touch and must hydrate the meter.
+  const restarted = mountWithRoute()
+  const hydratedStatus = restarted.registered.command.handler({ agent: { session }, args: 'status' })
+  assert.equal(hydratedStatus.text.includes('recovery: 0 of 6 elided results re-fetched'), true, hydratedStatus.text)
+  const hydratedPayload = callRoute(restarted.routes[0]).json
+  assert.equal(hydratedPayload.recovery.recovered, 0, 'the original call must not be counted as a re-fetch')
+  assert.equal(hydratedPayload.recovery.elided, 6, 'hydrate restored the meter sample base')
+  assert.equal(hydratedPayload.recovery.recoveredChars, 0)
+
+  // Six genuine re-fetches: one per distinct original signature.
+  for (let index = 0; index < 6; index += 1) {
+    session.append('tool/call', {
+      turn: 20 + index,
+      step: 1,
+      callId: `again-${index}`,
+      name: 'bash',
+      arguments: JSON.stringify({ command: `cat log-${index}` }),
+    })
+  }
+  setClock(NOW + 12 * MIN)
+  await restarted.emitPreStep(preStep(session), nextEnter())
+
+  const payload = callRoute(restarted.routes[0]).json
+  assert.equal(payload.recovery.recovered, 6, 'every re-fetch was counted')
+  assert.deepEqual(payload.recovery.protectedTools, ['bash'], 'hydrate restored enough state for auto-protection')
+
+  // Hydrate must carry each original result's character count into the meter too,
+  // otherwise recoveredChars degenerates to NaN (JSON would then serialise null).
+  const expectedRecoveredChars = replacedSeqs(session)
+    .map((seq) => measure(session.eventAt(seq).data.message.content).chars)
+    .reduce((sum, chars) => sum + chars, 0)
+  assert.ok(expectedRecoveredChars > 0)
+  assert.equal(Number.isFinite(payload.recovery.recoveredChars), true, 'recoveredChars must be a finite number')
+  assert.equal(typeof payload.recovery.recoveredChars, 'number')
+  assert.equal(payload.recovery.recoveredChars, expectedRecoveredChars, 'hydrate remembers the original result sizes')
+  assert.equal(JSON.stringify(payload).includes('"recoveredChars":null'), false, 'NaN must never serialise as null')
+
+  const statusText = restarted.registered.command.handler({ agent: { session }, args: 'status' }).text
+  assert.equal(statusText.includes('NaN'), false, statusText)
+  assert.equal(
+    statusText.includes(`~${formatTokens(Math.round(expectedRecoveredChars / 3))} tokens to re-fetch`),
+    true,
+    statusText,
+  )
+})
+
+test('D. calibration: the denominator is the whole request, not just tool results', async () => {
+  const session = Session.create('calibration-whole-request')
+  appendSystem(session, 4000)
+  appendUser(session, 'u'.repeat(3000), 0)
+  appendTurn(session, { turn: 0, callId: 'd0', content: [{ type: 'text', text: bigText('tool') }] })
+  appendTurn(session, { turn: 1, callId: 'd1', content: [{ type: 'text', text: 'small' }] })
+  appendTurn(session, { turn: 2, callId: 'd2', content: [{ type: 'text', text: 'small' }] })
+  const h = mountWithRoute()
+  setClock(NOW + 6 * MIN)
+
+  // Six requests with usage. `pendingChars` is the characters the adapter saw in
+  // that request (system + user + assistant + tool, stubs included); claiming
+  // tokens = chars / 2 must make the measured ratio land on 2. A tool-only
+  // denominator would make it far smaller (and clamp at 1.5 instead).
+  const points = []
+  for (let index = 0; index < 6; index += 1) {
+    await h.emitPreStep(preStep(session), nextEnter())
+    const chars = charsOfMessages(testing.readSurface(session).messages)
+    const tokens = Math.round(chars / 2)
+    points.push({ chars, tokens })
+    appendUsage(session, { inputTokens: tokens, cacheReadTokens: 0, cacheWriteTokens: 0 }, { turn: 10 + index, index })
+  }
+  await h.emitPreStep(preStep(session), nextEnter()) // consume the sixth usage event
+
+  const payload = callRoute(h.routes[0]).json
+  assert.equal(payload.estimate.samples, 6)
+  assert.equal(payload.estimate.measured, true)
+  assert.ok(
+    payload.estimate.charsPerToken > 1.9 && payload.estimate.charsPerToken < 2.1,
+    `chars/token ${payload.estimate.charsPerToken} must reflect the whole request`,
+  )
+  for (let index = 1; index < points.length; index += 1) {
+    assert.ok(points[index].tokens > points[index - 1].tokens, 'the samples must vary or the slope is unmeasurable')
+  }
+  assert.ok(payload.stats.lastCount >= 1, 'elision landed while calibrating')
+})
+
+test('E. /show twice recomputes from the log: the second call does not shrink', async () => {
+  const { session } = statsSession('show-stable', 6000)
+  const h = mountWithRoute()
+  setClock(NOW + 6 * MIN)
+  await h.emitPreStep(preStep(session), nextEnter())
+
+  const first = h.registered.command.handler({ agent: { session }, args: 'show' })
+  const second = h.registered.command.handler({ agent: { session }, args: 'show' })
+
+  assert.equal(first.kind, 'success')
+  assert.equal(second.kind, 'success')
+  assert.equal(first.text, second.text, 'repeat /show is byte-identical (no stub-size drift)')
+  assert.equal(second.text.includes('elided now: 1'), true)
+  assert.equal(second.text.includes(formatSize(6000)), true, 'it still reports the original size')
+})
+
+test('F. stats zero out when no stub is left on the surface (native compaction scenario)', async () => {
+  const { session } = statsSession('zero-when-gone', 6000)
+  const h = mountWithRoute()
+  setClock(NOW + 6 * MIN)
+  await h.emitPreStep(preStep(session), nextEnter())
+  const before = callRoute(h.routes[0]).json
+  assert.equal(before.stats.lastCount, 1)
+  assert.ok(before.stats.cumulativeChars > 0)
+
+  // Simulate the native pruner shadowing our stub with its own surface node:
+  // the log still has the replacement, but the current surface has no stub.
+  const stubbed = [...session.surface.nodes]
+    .map((seq) => ({ seq, event: session.eventAt(seq) }))
+    .find(({ event }) => event.type === 'tool/result' && JSON.stringify(event.data.message.content).includes('context-diet:'))
+  assert.ok(stubbed, 'a stub is on the surface')
+  session.append(
+    'tool/result',
+    { ...stubbed.event.data, message: { ...stubbed.event.data.message, content: [{ type: 'text', text: 'x'.repeat(6000) }] } },
+    { surfaceOp: { op: 'replace', startSeq: stubbed.seq, endSeq: stubbed.seq }, sourceEventSeqs: [stubbed.seq] },
+  )
+
+  await h.emitPreStep(preStep(session), nextEnter())
+  const after = callRoute(h.routes[0]).json
+  assert.equal(after.stats.lastCount, 0, 'no stub on the surface: lastCount is cleared')
+  assert.equal(after.stats.lastChars, 0, 'no stub on the surface: lastChars is cleared')
+  assert.equal(after.stats.cumulativeChars, before.stats.cumulativeChars, 'already-accumulated savings are not rewritten')
+  assert.equal(after.stats.requests, before.stats.requests, 'a stub-less pass is not a request with savings')
+  assert.equal(after.footer.includes('/req'), false, 'the footer must not claim a per-request saving')
 })
