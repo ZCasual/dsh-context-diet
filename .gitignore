@@ -1,0 +1,14 @@
+# Installed on demand; never committed.
+node_modules/
+
+# Local research and working notes that are not part of the published bundle.
+.internal/
+
+# npm pack output.
+*.tgz
+npm-debug.log*
+
+# Editor and OS noise.
+.DS_Store
+.idea/
+.vscode/

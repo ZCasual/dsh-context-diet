@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "上下文节食",
+    "description": "用可回放的持久替换，从模型可见的会话表面裁掉陈旧、过大的工具结果。默认开启，可在 Settings → Plugins → Context Diet 中配置。"
+  }
+}

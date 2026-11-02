@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Context Diet">
+  <title>Context Diet</title>
+  <rect x="0" y="0" width="64" height="64" rx="14" fill="#0E3A2C"/>
+  <rect x="8" y="10" width="36" height="44" rx="6" fill="#F2FBF6"/>
+  <!-- head of the tool result: kept -->
+  <rect x="14" y="18" width="24" height="4" rx="2" fill="#1F7A5C"/>
+  <!-- elided middle: collapsed to a dotted stub -->
+  <line x1="14" y1="28" x2="32" y2="28" stroke="#8CC7B0" stroke-width="3" stroke-linecap="round" stroke-dasharray="1 5"/>
+  <!-- tail of the tool result: kept -->
+  <rect x="14" y="36" width="14" height="4" rx="2" fill="#1F7A5C"/>
+  <rect x="14" y="44" width="9" height="3" rx="1.5" fill="#A9D6C3"/>
+  <!-- diet leaf: original artwork -->
+  <path d="M56 40C56 49 49 56 40 56C40 47 47 40 56 40Z" fill="#3DBB6E"/>
+  <path d="M41.5 54.5C45 50 48.5 46 53 43.5" stroke="#0E3A2C" stroke-width="1.6" stroke-linecap="round" fill="none" opacity="0.55"/>
+</svg>

@@ -1,0 +1,11 @@
+# The row and plugin Config default to enabled. Use `/context-diet off` for a
+# session-only pause, or edit this ordinary Config through the profile patch.
+# Do not add `disabled: true` unless unloading the Host plugin is intended.
+#
+# Overriding this row replaces the whole `config` block. The explicit enabled
+# value keeps the profile default clear; all other keys use Config defaults.
+- insert:
+    - id: dsh-context-diet
+      name: 'dsh-context-diet'
+      config:
+        enabled: true

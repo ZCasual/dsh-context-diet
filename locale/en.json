@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Context Diet",
+    "description": "Elides stale, oversized tool results from the model-visible session surface using durable, replayable replacements. Enabled by default; configure it in Settings → Plugins → Context Diet."
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "name": "dsh-context-diet",
+  "version": "0.1.0",
+  "description": "Durable, replay-safe elision of stale tool results from the model-visible DeepSeek Harness (DSH) session surface. Enabled by default.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "cordis-plugin",
+    "context",
+    "tokens",
+    "compaction",
+    "tool-result",
+    "session"
+  ],
+  "license": "MIT",
+  "author": "dsh-context-diet contributors",
+  "homepage": "https://github.com/ZCasual/dsh-context-diet#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZCasual/dsh-context-diet.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ZCasual/dsh-context-diet/issues"
+  },
+  "icon": "./icon.svg",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "core.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js test/unit/*.test.js",
+    "check": "node --check index.js && node --check core.js"
+  },
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.1-rc.5 <0.3.0-0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.5",
+    "@deepseek-ai/dsh-session": "^0.2.1-rc.5",
+    "@deepseek-ai/schemastery": "^3.18.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-session": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.5",
+    "@deepseek-ai/schemastery": "3.18.5"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
