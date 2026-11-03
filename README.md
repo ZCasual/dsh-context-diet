@@ -204,6 +204,24 @@ dsh --profile <profile> --dump-config | grep -A3 dsh-context-diet
 | Token accounting | Corrected by the `compaction/prune` shadow price; no private estimator. |
 | Other sessions | Untouched. |
 
+## Troubleshooting
+
+**The footer does not appear.** Check, in this order:
+
+1. Is the client half composed? `cordis_inspect_query` with `platform: "client"`,
+   `provider: "Slots"`, `method: "listSubTree"`, `input: { root: "conversation.composer.dock" }`
+   must list an occupant `{ id: "context-diet", order: 2 }` beside `activity` and `usage`.
+2. Was this bundle ever installed **without** `client.js`? Then the module cache holds
+   its "not a client package" verdict for the life of the Harness process, and the
+   client half you added later cannot compose until the process restarts. Restart
+   `dsh web` once; after that the verdict is positive and later reinstalls are fine.
+3. Reload the page once if the bundle was installed after the page opened; the boot
+   graph is fetched at page load.
+
+**The footer shows `🥗 on` and never a number.** Nothing is eligible yet: results must
+be older than `keepTurns`, larger than `minChars`, plain text, and the prompt cache
+must be cold (`cacheTtlMinutes`). `/context-diet show` explains both lists.
+
 ## Known limits
 
 - No cache-cold arbitration: the gate is idle time, an approximation of the cache

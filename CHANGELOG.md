@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-03
+
+Documentation release. No behaviour change.
+
+### Added
+
+- Troubleshooting section: the composer footer's slot occupant check, the
+  `dsh-client-modules` package-metadata cache that hides a client half added after
+  the first install until the Harness restarts, and the reasons a footer can read
+  `🥗 on` with no number.
+
 ## [0.2.1] - 2026-11-03
 
 Corrections found by an independent fidelity audit of 0.2.0.
